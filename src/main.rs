@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{collections::HashMap, env, fs, path::PathBuf};
 
 use anyhow::{bail, Context, Result};
 use pulldown_cmark::{html, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -113,8 +113,11 @@ fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
             }
             TaoEvent::UserEvent(AppEvent::Render { markdown, marker }) => {
                 if let Some(webview) = webview.as_ref() {
-                    let html = render_markdown_safely(&markdown);
-                    if let Err(error) = apply_rendered_html(webview, &html, &marker) {
+                    let expanded_markdown = expand_toc_markers(&markdown);
+                    let html = render_markdown_safely(&expanded_markdown);
+                    if let Err(error) =
+                        apply_rendered_html(webview, &html, &expanded_markdown, &marker)
+                    {
                         eprintln!("failed to update rendered markdown: {error}");
                     }
                 }
@@ -213,8 +216,9 @@ const THEMES: &[ThemeDefinition] = &[
 ];
 
 fn build_app_html(markdown: &str) -> Result<String> {
-    let rendered = render_markdown_safely(markdown);
-    let markdown_json = serde_json::to_string(markdown)?;
+    let expanded_markdown = expand_toc_markers(markdown);
+    let rendered = render_markdown_safely(&expanded_markdown);
+    let markdown_json = serde_json::to_string(&expanded_markdown)?;
     let rendered_json = serde_json::to_string(&rendered)?;
     let themes_json = serde_json::to_string(THEMES)?;
 
@@ -227,13 +231,15 @@ fn build_app_html(markdown: &str) -> Result<String> {
 fn apply_rendered_html(
     webview: &WebView,
     rendered_html: &str,
+    expanded_markdown: &str,
     marker: &ScrollMarker,
 ) -> Result<()> {
     let html_json = serde_json::to_string(rendered_html)?;
+    let markdown_json = serde_json::to_string(expanded_markdown)?;
     let marker_json = serde_json::to_string(marker)?;
     webview
         .evaluate_script(&format!(
-            "window.__mdReaderApplyRendered({html_json}, {marker_json});"
+            "window.__mdReaderApplyRendered({html_json}, {markdown_json}, {marker_json});"
         ))
         .context("WebView2 rejected rendered markdown update")
 }
@@ -249,7 +255,224 @@ fn notify_save_finished(webview: &WebView, result: Result<()>) {
     ));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeadingEntry {
+    level: usize,
+    text: String,
+    slug: String,
+}
+
+fn expand_toc_markers(markdown: &str) -> String {
+    if !markdown
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("[toc]"))
+    {
+        return markdown.to_string();
+    }
+
+    let headings = collect_markdown_headings(markdown);
+    if headings.is_empty() {
+        return markdown.to_string();
+    }
+
+    let toc = render_markdown_toc(&headings);
+    let mut expanded = Vec::new();
+    for line in markdown.lines() {
+        if line.trim().eq_ignore_ascii_case("[toc]") {
+            expanded.push(toc.clone());
+        } else {
+            expanded.push(line.to_string());
+        }
+    }
+
+    let mut result = expanded.join("\n");
+    if markdown.ends_with('\n') || markdown.ends_with('\r') {
+        result.push('\n');
+    }
+    result
+}
+
+fn collect_markdown_headings(markdown: &str) -> Vec<HeadingEntry> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut headings = Vec::new();
+    let mut used_slugs = HashMap::new();
+    let mut in_fence = false;
+    let mut fence_char = '\0';
+    let mut index = 0;
+
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if let Some(marker) = fence_marker(trimmed) {
+            if in_fence && marker == fence_char {
+                in_fence = false;
+            } else if !in_fence {
+                in_fence = true;
+                fence_char = marker;
+            }
+            index += 1;
+            continue;
+        }
+
+        if in_fence {
+            index += 1;
+            continue;
+        }
+
+        if let Some((level, text)) = parse_atx_heading(lines[index]) {
+            let slug = unique_heading_slug(&text, headings.len(), &mut used_slugs);
+            headings.push(HeadingEntry { level, text, slug });
+            index += 1;
+            continue;
+        }
+
+        if index + 1 < lines.len() {
+            if let Some(level) = parse_setext_underline(lines[index + 1]) {
+                let text = clean_heading_text(lines[index].trim());
+                if !text.is_empty() {
+                    let slug = unique_heading_slug(&text, headings.len(), &mut used_slugs);
+                    headings.push(HeadingEntry { level, text, slug });
+                    index += 2;
+                    continue;
+                }
+            }
+        }
+
+        index += 1;
+    }
+
+    headings
+}
+
+fn render_markdown_toc(headings: &[HeadingEntry]) -> String {
+    let min_level = headings
+        .iter()
+        .map(|heading| heading.level)
+        .min()
+        .unwrap_or(1);
+    headings
+        .iter()
+        .map(|heading| {
+            let indent = "  ".repeat(heading.level.saturating_sub(min_level));
+            format!(
+                "{indent}- [{}](#{})",
+                escape_toc_link_text(&heading.text),
+                heading.slug
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_atx_heading(line: &str) -> Option<(usize, String)> {
+    let trimmed = line.trim_start();
+    let level = trimmed
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+
+    let remainder = &trimmed[level..];
+    if !remainder.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+
+    let mut text = remainder.trim();
+    if let Some(stripped) = text.strip_suffix('#') {
+        text = stripped.trim_end_matches('#').trim_end();
+    }
+    Some((level, clean_heading_text(text)))
+}
+
+fn parse_setext_underline(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    if trimmed.len() < 2 {
+        return None;
+    }
+
+    if trimmed.chars().all(|character| character == '=') {
+        return Some(1);
+    }
+    if trimmed.chars().all(|character| character == '-') {
+        return Some(2);
+    }
+    None
+}
+
+fn fence_marker(trimmed_line: &str) -> Option<char> {
+    if trimmed_line.starts_with("```") {
+        return Some('`');
+    }
+    if trimmed_line.starts_with("~~~") {
+        return Some('~');
+    }
+    None
+}
+
+fn clean_heading_text(text: &str) -> String {
+    let mut cleaned = text.trim().to_string();
+    if let Some(start) = cleaned.rfind(" {#") {
+        if cleaned.ends_with('}') {
+            cleaned.truncate(start);
+        }
+    }
+    cleaned.trim().to_string()
+}
+
+fn escape_toc_link_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn unique_heading_slug(
+    text: &str,
+    section_index: usize,
+    used_slugs: &mut HashMap<String, usize>,
+) -> String {
+    let base = slugify_heading(text).unwrap_or_else(|| format!("section-{section_index}"));
+    let count = used_slugs.entry(base.clone()).or_insert(0);
+    let slug = if *count == 0 {
+        base
+    } else {
+        format!("{base}-{count}")
+    };
+    *count += 1;
+    slug
+}
+
+fn slugify_heading(text: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut last_was_separator = false;
+
+    for character in text.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            last_was_separator = false;
+        } else if (character.is_whitespace() || matches!(character, '-' | '_' | '.' | '/' | ':'))
+            && !last_was_separator
+            && !slug.is_empty()
+        {
+            slug.push('-');
+            last_was_separator = true;
+        }
+    }
+
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn render_markdown_safely(markdown: &str) -> String {
+    let markdown = expand_toc_markers(markdown);
+    let heading_ids = collect_markdown_headings(&markdown)
+        .into_iter()
+        .map(|heading| heading.slug)
+        .collect::<Vec<_>>();
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
@@ -257,18 +480,22 @@ fn render_markdown_safely(markdown: &str) -> String {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
-    let parser = Parser::new_ext(markdown, options);
+    let parser = Parser::new_ext(&markdown, options);
     let mut next_heading_index = 0usize;
     let indexed_events = parser.map(move |event| match event {
         Event::Start(Tag::Heading { level, .. }) => {
             let tag = heading_tag(level);
             let index = next_heading_index;
             next_heading_index += 1;
+            let heading_id = heading_ids
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| format!("section-{index}"));
             // The data attribute is the bridge between Rust-rendered headings and
-            // JavaScript scroll restoration. It avoids relying on user heading text
-            // or generated slugs, both of which can collide during editing.
+            // JavaScript scroll restoration. The id is human-readable for TOC
+            // links; the data index remains stable while the user edits headings.
             Event::Html(
-                format!(r#"<{tag} id="section-{index}" data-md-section-index="{index}">"#).into(),
+                format!(r#"<{tag} id="{heading_id}" data-md-section-index="{index}">"#).into(),
             )
         }
         Event::End(TagEnd::Heading(level)) => {
@@ -338,7 +565,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 
     body {
       display: grid;
-      grid-template-rows: 34px minmax(0, 1fr);
+      grid-template-rows: 34px auto minmax(0, 1fr);
     }
 
     nav {
@@ -397,6 +624,46 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       stroke-linejoin: round;
       fill: none;
       pointer-events: none;
+    }
+
+    .format-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-height: 34px;
+      padding: 3px 12px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+
+    body.editing .format-toolbar {
+      display: none;
+    }
+
+    .format-select {
+      width: 70px;
+      min-height: 28px;
+      padding: 2px 6px;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font: 13px/1.2 "Segoe UI", system-ui, sans-serif;
+    }
+
+    .format-divider {
+      width: 1px;
+      height: 20px;
+      margin: 0 3px;
+      background: var(--border);
+    }
+
+    .format-button {
+      font: 600 13px/1 "Segoe UI", system-ui, sans-serif;
+    }
+
+    .format-button.italic-label {
+      font-style: italic;
     }
 
     .switch {
@@ -631,8 +898,8 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       color: var(--muted);
     }
 
-    select,
-    input[type="file"] {
+    .settings-body select,
+    .settings-body input[type="file"] {
       width: 100%;
       min-height: 32px;
       color: var(--ink);
@@ -668,6 +935,48 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       </svg>
     </button>
   </nav>
+  <div id="format-toolbar" class="format-toolbar" aria-label="Formatting">
+    <select id="block-format" class="format-select" title="Block format" aria-label="Block format">
+      <option value="p">P</option>
+      <option value="h1">H1</option>
+      <option value="h2">H2</option>
+      <option value="h3">H3</option>
+      <option value="h4">H4</option>
+      <option value="blockquote">Quote</option>
+      <option value="pre">Code</option>
+    </select>
+    <span class="format-divider"></span>
+    <button class="icon-button format-button" type="button" data-command="bold" title="Bold" aria-label="Bold">B</button>
+    <button class="icon-button format-button italic-label" type="button" data-command="italic" title="Italic" aria-label="Italic">I</button>
+    <button id="inline-code-button" class="icon-button format-button" type="button" title="Inline code" aria-label="Inline code">{}</button>
+    <button id="link-button" class="icon-button" type="button" title="Link" aria-label="Link">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path>
+        <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path>
+      </svg>
+    </button>
+    <span class="format-divider"></span>
+    <button class="icon-button" type="button" data-command="insertUnorderedList" title="Bullet list" aria-label="Bullet list">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M8 6h12"></path>
+        <path d="M8 12h12"></path>
+        <path d="M8 18h12"></path>
+        <path d="M4 6h.01"></path>
+        <path d="M4 12h.01"></path>
+        <path d="M4 18h.01"></path>
+      </svg>
+    </button>
+    <button class="icon-button" type="button" data-command="insertOrderedList" title="Numbered list" aria-label="Numbered list">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M10 6h10"></path>
+        <path d="M10 12h10"></path>
+        <path d="M10 18h10"></path>
+        <path d="M4 6h1v4"></path>
+        <path d="M4 10h2"></path>
+        <path d="M4 14h2l-2 4h2"></path>
+      </svg>
+    </button>
+  </div>
   <main>
     <textarea id="editor" spellcheck="false" wrap="off"></textarea>
     <article id="rendered" contenteditable="true" spellcheck="true"></article>
@@ -710,6 +1019,9 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const customCssInput = document.getElementById("custom-css-input");
     const themeStyle = document.getElementById("theme-style");
     const customThemeStyle = document.getElementById("custom-theme-style");
+    const blockFormat = document.getElementById("block-format");
+    const inlineCodeButton = document.getElementById("inline-code-button");
+    const linkButton = document.getElementById("link-button");
     const storageKeys = {
       theme: "markdown-reader.theme",
       customCss: "markdown-reader.custom-css"
@@ -717,6 +1029,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     let dirty = false;
     let renderedDirty = false;
     let customCss = loadStoredValue(storageKeys.customCss, "");
+    let savedRenderedRange = null;
 
     editor.value = initialMarkdown;
     rendered.innerHTML = initialRendered;
@@ -914,7 +1227,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 
     function blockMarkdown(node, depth) {
       if (node.nodeType === Node.TEXT_NODE) {
-        return normalizeText(node.textContent).trim();
+        return protectParagraphMarkdown(normalizeText(node.textContent).trim());
       }
       if (node.nodeType !== Node.ELEMENT_NODE) {
         return "";
@@ -926,7 +1239,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         return `${'#'.repeat(level)} ${inlineMarkdown(node).trim()}`;
       }
       if (tag === "p") {
-        return inlineMarkdown(node).trim();
+        return protectParagraphMarkdown(inlineMarkdown(node).trim());
       }
       if (tag === "pre") {
         return fencedCode(node.innerText || node.textContent || "");
@@ -970,7 +1283,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 
     function inlineMarkdown(node) {
       if (node.nodeType === Node.TEXT_NODE) {
-        return escapeInlineText(node.textContent);
+        return normalizeText(node.textContent);
       }
       if (node.nodeType !== Node.ELEMENT_NODE) {
         return "";
@@ -995,7 +1308,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         return `[${text}](${href.replace(/\)/g, "%29")})`;
       }
       if (tag === "img") {
-        const alt = escapeInlineText(node.getAttribute("alt") || "");
+        const alt = normalizeText(node.getAttribute("alt") || "");
         const src = node.getAttribute("src") || "";
         return src ? `![${alt}](${src.replace(/\)/g, "%29")})` : alt;
       }
@@ -1088,8 +1401,11 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       return (text || "").replace(/\u00a0/g, " ");
     }
 
-    function escapeInlineText(text) {
-      return normalizeText(text).replace(/[\\`*_{}\[\]<>]/g, "\\$&");
+    function protectParagraphMarkdown(text) {
+      if (/^\s*(#{1,6}\s|[-+*]\s+|\d+[.)]\s+|>\s+|\[toc\]\s*$)/i.test(text)) {
+        return text.replace(/^(\s*)(\S)/, "$1\\$2");
+      }
+      return text;
     }
 
     function populateThemes() {
@@ -1138,9 +1454,88 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       settingsButton.focus();
     }
 
+    function markRenderedEdited() {
+      renderedDirty = true;
+      setDirty(true);
+      saveRenderedSelection();
+    }
+
+    function saveRenderedSelection() {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0) {
+        return;
+      }
+      if (selection.anchorNode && selection.focusNode && rendered.contains(selection.anchorNode) && rendered.contains(selection.focusNode)) {
+        savedRenderedRange = selection.getRangeAt(0).cloneRange();
+      }
+    }
+
+    function restoreRenderedSelection() {
+      rendered.focus();
+      if (!savedRenderedRange) {
+        return;
+      }
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(savedRenderedRange);
+    }
+
+    function applyDocumentCommand(command, value = null) {
+      restoreRenderedSelection();
+      document.execCommand(command, false, value);
+      markRenderedEdited();
+    }
+
+    function applyBlockFormat(tag) {
+      restoreRenderedSelection();
+      document.execCommand("formatBlock", false, `<${tag}>`);
+      markRenderedEdited();
+    }
+
+    function applyInlineCode() {
+      restoreRenderedSelection();
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0 || !selection.anchorNode || !rendered.contains(selection.anchorNode)) {
+        return;
+      }
+
+      const selectedText = selection.toString() || "code";
+      document.execCommand("insertHTML", false, `<code>${escapeHtml(selectedText)}</code>`);
+      markRenderedEdited();
+    }
+
+    function applyLink() {
+      restoreRenderedSelection();
+      const url = window.prompt("URL");
+      if (!url) {
+        return;
+      }
+
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+        const label = window.prompt("Text") || url;
+        document.execCommand("insertHTML", false, `<a href="${escapeAttribute(url)}">${escapeHtml(label)}</a>`);
+      } else {
+        document.execCommand("createLink", false, url);
+      }
+      markRenderedEdited();
+    }
+
+    function escapeHtml(text) {
+      return normalizeText(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function escapeAttribute(text) {
+      return escapeHtml(text).replace(/"/g, "&quot;");
+    }
+
     // Rendering stays in Rust so opened Markdown is processed by pulldown-cmark
     // and ammonia before it is assigned to innerHTML.
-    window.__mdReaderApplyRendered = (html, marker) => {
+    window.__mdReaderApplyRendered = (html, expandedMarkdown, marker) => {
+      editor.value = expandedMarkdown;
       rendered.innerHTML = html;
       renderedDirty = false;
       document.body.classList.remove("editing");
@@ -1195,6 +1590,21 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       customCssInput.value = "";
     });
 
+    document.querySelectorAll("[data-command]").forEach((button) => {
+      button.addEventListener("mousedown", (event) => event.preventDefault());
+      button.addEventListener("click", () => applyDocumentCommand(button.dataset.command));
+    });
+
+    blockFormat.addEventListener("change", () => {
+      applyBlockFormat(blockFormat.value);
+    });
+
+    inlineCodeButton.addEventListener("mousedown", (event) => event.preventDefault());
+    inlineCodeButton.addEventListener("click", applyInlineCode);
+
+    linkButton.addEventListener("mousedown", (event) => event.preventDefault());
+    linkButton.addEventListener("click", applyLink);
+
     editor.addEventListener("input", () => {
       setDirty(true);
     });
@@ -1202,6 +1612,16 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     rendered.addEventListener("input", () => {
       renderedDirty = true;
       setDirty(true);
+      saveRenderedSelection();
+    });
+
+    rendered.addEventListener("keyup", saveRenderedSelection);
+    rendered.addEventListener("mouseup", saveRenderedSelection);
+
+    document.addEventListener("selectionchange", () => {
+      if (!document.body.classList.contains("editing")) {
+        saveRenderedSelection();
+      }
     });
 
     document.addEventListener("keydown", (event) => {
@@ -1219,6 +1639,13 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       const anchor = event.target.closest("a");
       if (anchor) {
         event.preventDefault();
+        const href = anchor.getAttribute("href") || "";
+        if (href.startsWith('#')) {
+          const target = document.getElementById(href.slice(1));
+          if (target) {
+            rendered.scrollTop = Math.max(0, target.offsetTop - 28);
+          }
+        }
       }
     });
 
@@ -1246,7 +1673,7 @@ mod tests {
 
         assert!(html.contains(r#"data-md-section-index="0""#));
         assert!(html.contains(r#"data-md-section-index="1""#));
-        assert!(html.contains(r#"id="section-0""#));
+        assert!(html.contains(r#"id="one""#));
     }
 
     #[test]
@@ -1264,6 +1691,7 @@ mod tests {
         assert!(!html.contains("__THEMES__"));
         assert!(html.contains("save-button"));
         assert!(html.contains("settings-button"));
+        assert!(html.contains("format-toolbar"));
         assert!(html.contains("contenteditable=\"true\""));
     }
 
@@ -1271,5 +1699,28 @@ mod tests {
     fn built_in_themes_are_embedded() {
         assert!(THEMES.len() >= 3);
         assert!(THEMES.iter().all(|theme| theme.css.contains(":root")));
+    }
+
+    #[test]
+    fn toc_marker_expands_to_markdown_links() {
+        let expanded = expand_toc_markers("[toc]\n\n# One\n\n## Two\n");
+
+        assert!(expanded.contains("- [One](#one)"));
+        assert!(expanded.contains("  - [Two](#two)"));
+        assert!(!expanded.contains("[toc]"));
+    }
+
+    #[test]
+    fn renderer_expands_toc_marker_to_internal_links() {
+        let html = render_markdown_safely("[toc]\n\n# One");
+
+        assert!(html.contains(r##"href="#one""##));
+        assert!(html.contains(r#"data-md-section-index="0""#));
+    }
+
+    #[test]
+    fn formatted_serializer_no_longer_uses_global_inline_escaping() {
+        assert!(APP_HTML_TEMPLATE.contains("function protectParagraphMarkdown"));
+        assert!(!APP_HTML_TEMPLATE.contains(r#"replace(/[\\`*_{}\[\]<>]/g"#));
     }
 }

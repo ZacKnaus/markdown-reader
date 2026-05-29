@@ -15,10 +15,15 @@ The app expects UTF-8 Markdown. Passing zero arguments or more than one position
 - Toggle off to edit the plaintext Markdown.
 - Toggle on to render the current editor contents.
 - Make small text edits directly in the formatted view when that is faster.
+- Use the formatted-view toolbar for headings, bold, italic, inline code, links, bullet lists, numbered lists, blockquotes, and code blocks.
 - Use the save button or press `Ctrl+S` to save.
 - Closing the window autosaves the current editor contents before exit.
 
-Formatted-view edits are converted back to conservative Markdown when saving or switching to plaintext. That path preserves common structures such as headings, paragraphs, lists, blockquotes, code blocks, links, images, and tables, but it may normalize the original Markdown formatting.
+Formatted-view edits are converted back to conservative Markdown when saving or switching to plaintext. That path preserves common structures such as headings, paragraphs, lists, blockquotes, code blocks, links, images, and tables, but it may normalize some original spacing.
+
+## Table Of Contents
+
+Add `[toc]` on its own line in plaintext mode to generate a table of contents from the document headings. Switching to formatted view expands the marker into Markdown links, and switching back to plaintext keeps the populated TOC in the document.
 
 ## Themes
 
