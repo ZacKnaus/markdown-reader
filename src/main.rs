@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::{collections::HashMap, env, fs, path::PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -65,8 +67,8 @@ fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
             Ok(IpcMessage::Save { markdown }) => {
                 let _ = proxy.send_event(AppEvent::Save { markdown });
             }
-            Ok(IpcMessage::CloseSave { markdown }) => {
-                let _ = proxy.send_event(AppEvent::CloseSave { markdown });
+            Ok(IpcMessage::Close) => {
+                let _ = proxy.send_event(AppEvent::Close);
             }
             Err(error) => eprintln!("invalid IPC message: {error}"),
         };
@@ -80,7 +82,6 @@ fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
         .build(&window)
         .context("failed to create WebView2 surface")?;
     let mut webview = Some(webview);
-    let mut close_pending = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -90,17 +91,12 @@ fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                if close_pending {
-                    return;
-                }
-
-                close_pending = true;
                 if let Some(view) = webview.as_ref() {
                     // Closing is routed through JavaScript because the Rust side cannot
-                    // synchronously read the current textarea contents from WebView2.
+                    // synchronously inspect the dirty state from WebView2.
                     if view
                         .evaluate_script(
-                            "window.__mdReaderRequestCloseSave && window.__mdReaderRequestCloseSave();",
+                            "window.__mdReaderRequestClose && window.__mdReaderRequestClose();",
                         )
                         .is_err()
                     {
@@ -129,21 +125,9 @@ fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
                     notify_save_finished(webview, result);
                 }
             }
-            TaoEvent::UserEvent(AppEvent::CloseSave { markdown }) => {
-                let result = fs::write(&input_path, markdown.as_bytes())
-                    .with_context(|| format!("failed to save {}", input_path.display()));
-                match result {
-                    Ok(()) => {
-                        let _ = webview.take();
-                        *control_flow = ControlFlow::Exit;
-                    }
-                    Err(error) => {
-                        close_pending = false;
-                        if let Some(webview) = webview.as_ref() {
-                            notify_save_finished(webview, Err(error));
-                        }
-                    }
-                }
+            TaoEvent::UserEvent(AppEvent::Close) => {
+                let _ = webview.take();
+                *control_flow = ControlFlow::Exit;
             }
             _ => {}
         }
@@ -159,9 +143,7 @@ enum AppEvent {
     Save {
         markdown: String,
     },
-    CloseSave {
-        markdown: String,
-    },
+    Close,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,9 +156,7 @@ enum IpcMessage {
     Save {
         markdown: String,
     },
-    CloseSave {
-        markdown: String,
-    },
+    Close,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -565,7 +545,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 
     body {
       display: grid;
-      grid-template-rows: 34px auto minmax(0, 1fr);
+      grid-template-rows: 34px minmax(0, 1fr);
     }
 
     nav {
@@ -626,17 +606,13 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       pointer-events: none;
     }
 
-    .format-toolbar {
+    .format-tools {
       display: flex;
       align-items: center;
       gap: 4px;
-      min-height: 34px;
-      padding: 3px 12px;
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
     }
 
-    body.editing .format-toolbar {
+    body.editing .format-tools {
       display: none;
     }
 
@@ -915,6 +891,48 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 </head>
 <body>
   <nav>
+    <div id="format-toolbar" class="format-tools" aria-label="Formatting">
+      <select id="block-format" class="format-select" title="Block format" aria-label="Block format">
+        <option value="p">P</option>
+        <option value="h1">H1</option>
+        <option value="h2">H2</option>
+        <option value="h3">H3</option>
+        <option value="h4">H4</option>
+        <option value="blockquote">Quote</option>
+        <option value="pre">Code</option>
+      </select>
+      <span class="format-divider"></span>
+      <button class="icon-button format-button" type="button" data-command="bold" title="Bold" aria-label="Bold">B</button>
+      <button class="icon-button format-button italic-label" type="button" data-command="italic" title="Italic" aria-label="Italic">I</button>
+      <button id="inline-code-button" class="icon-button format-button" type="button" title="Inline code" aria-label="Inline code">{}</button>
+      <button id="link-button" class="icon-button" type="button" title="Link" aria-label="Link">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path>
+          <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path>
+        </svg>
+      </button>
+      <span class="format-divider"></span>
+      <button class="icon-button" type="button" data-command="insertUnorderedList" title="Bullet list" aria-label="Bullet list">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M8 6h12"></path>
+          <path d="M8 12h12"></path>
+          <path d="M8 18h12"></path>
+          <path d="M4 6h.01"></path>
+          <path d="M4 12h.01"></path>
+          <path d="M4 18h.01"></path>
+        </svg>
+      </button>
+      <button class="icon-button" type="button" data-command="insertOrderedList" title="Numbered list" aria-label="Numbered list">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M10 6h10"></path>
+          <path d="M10 12h10"></path>
+          <path d="M10 18h10"></path>
+          <path d="M4 6h1v4"></path>
+          <path d="M4 10h2"></path>
+          <path d="M4 14h2l-2 4h2"></path>
+        </svg>
+      </button>
+    </div>
     <div class="nav-spacer"></div>
     <button id="save-button" class="icon-button saved" type="button" title="Save" aria-label="Save">
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -935,48 +953,6 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       </svg>
     </button>
   </nav>
-  <div id="format-toolbar" class="format-toolbar" aria-label="Formatting">
-    <select id="block-format" class="format-select" title="Block format" aria-label="Block format">
-      <option value="p">P</option>
-      <option value="h1">H1</option>
-      <option value="h2">H2</option>
-      <option value="h3">H3</option>
-      <option value="h4">H4</option>
-      <option value="blockquote">Quote</option>
-      <option value="pre">Code</option>
-    </select>
-    <span class="format-divider"></span>
-    <button class="icon-button format-button" type="button" data-command="bold" title="Bold" aria-label="Bold">B</button>
-    <button class="icon-button format-button italic-label" type="button" data-command="italic" title="Italic" aria-label="Italic">I</button>
-    <button id="inline-code-button" class="icon-button format-button" type="button" title="Inline code" aria-label="Inline code">{}</button>
-    <button id="link-button" class="icon-button" type="button" title="Link" aria-label="Link">
-      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path>
-        <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path>
-      </svg>
-    </button>
-    <span class="format-divider"></span>
-    <button class="icon-button" type="button" data-command="insertUnorderedList" title="Bullet list" aria-label="Bullet list">
-      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M8 6h12"></path>
-        <path d="M8 12h12"></path>
-        <path d="M8 18h12"></path>
-        <path d="M4 6h.01"></path>
-        <path d="M4 12h.01"></path>
-        <path d="M4 18h.01"></path>
-      </svg>
-    </button>
-    <button class="icon-button" type="button" data-command="insertOrderedList" title="Numbered list" aria-label="Numbered list">
-      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M10 6h10"></path>
-        <path d="M10 12h10"></path>
-        <path d="M10 18h10"></path>
-        <path d="M4 6h1v4"></path>
-        <path d="M4 10h2"></path>
-        <path d="M4 14h2l-2 4h2"></path>
-      </svg>
-    </button>
-  </div>
   <main>
     <textarea id="editor" spellcheck="false" wrap="off"></textarea>
     <article id="rendered" contenteditable="true" spellcheck="true"></article>
@@ -1535,9 +1511,13 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     // Rendering stays in Rust so opened Markdown is processed by pulldown-cmark
     // and ammonia before it is assigned to innerHTML.
     window.__mdReaderApplyRendered = (html, expandedMarkdown, marker) => {
+      const previousMarkdown = editor.value;
       editor.value = expandedMarkdown;
       rendered.innerHTML = html;
       renderedDirty = false;
+      if (expandedMarkdown !== previousMarkdown) {
+        setDirty(true);
+      }
       document.body.classList.remove("editing");
       toggle.checked = true;
       requestAnimationFrame(() => applyMarkerToRendered(marker));
@@ -1551,8 +1531,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       alert(message || "Save failed.");
     };
 
-    window.__mdReaderRequestCloseSave = () => {
-      postMessage({ kind: "closeSave", markdown: currentMarkdownForSave() });
+    window.__mdReaderRequestClose = () => {
+      if (!dirty || window.confirm("Close without saving changes?")) {
+        postMessage({ kind: "close" });
+      }
     };
 
     toggle.addEventListener("change", () => {
@@ -1692,7 +1674,17 @@ mod tests {
         assert!(html.contains("save-button"));
         assert!(html.contains("settings-button"));
         assert!(html.contains("format-toolbar"));
+        assert!(html.contains(r#"grid-template-rows: 34px minmax(0, 1fr)"#));
         assert!(html.contains("contenteditable=\"true\""));
+    }
+
+    #[test]
+    fn app_html_requires_explicit_save() {
+        let html = build_app_html("[toc]\n\n# One").expect("app html should render");
+
+        assert!(html.contains("__mdReaderRequestClose"));
+        assert!(html.contains("Close without saving changes?"));
+        assert!(!html.contains("closeSave"));
     }
 
     #[test]
