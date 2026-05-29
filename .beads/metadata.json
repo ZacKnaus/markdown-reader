@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "mdreader",
+  "project_id": "39a04a03-d387-4a5b-8682-a6c7fe680eab"
+}
