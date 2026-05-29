@@ -1,6 +1,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use std::{collections::HashMap, env, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
 use pulldown_cmark::{html, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -27,7 +31,8 @@ fn run() -> Result<()> {
     let input_path = parse_single_input_path()?;
     let markdown = fs::read_to_string(&input_path)
         .with_context(|| format!("failed to read {}", input_path.display()))?;
-    launch_window(input_path, markdown)
+    let settings = load_app_settings();
+    launch_window(input_path, markdown, settings)
 }
 
 fn parse_single_input_path() -> Result<PathBuf> {
@@ -43,9 +48,10 @@ fn parse_single_input_path() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
+fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -> Result<()> {
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let settings_path = app_settings_path();
     let window_title = input_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -70,10 +76,13 @@ fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
             Ok(IpcMessage::Close) => {
                 let _ = proxy.send_event(AppEvent::Close);
             }
+            Ok(IpcMessage::SaveSettings { settings }) => {
+                let _ = proxy.send_event(AppEvent::SaveSettings { settings });
+            }
             Err(error) => eprintln!("invalid IPC message: {error}"),
         };
 
-    let initial_html = build_app_html(&markdown)?;
+    let initial_html = build_app_html(&markdown, &settings)?;
     let builder = WebViewBuilder::new()
         .with_html(initial_html)
         .with_ipc_handler(handler)
@@ -129,6 +138,12 @@ fn launch_window(input_path: PathBuf, markdown: String) -> Result<()> {
                 let _ = webview.take();
                 *control_flow = ControlFlow::Exit;
             }
+            TaoEvent::UserEvent(AppEvent::SaveSettings { settings }) => {
+                if let Some(webview) = webview.as_ref() {
+                    let result = save_app_settings(&settings_path, &settings);
+                    notify_settings_finished(webview, result);
+                }
+            }
             _ => {}
         }
     });
@@ -144,6 +159,9 @@ enum AppEvent {
         markdown: String,
     },
     Close,
+    SaveSettings {
+        settings: AppSettings,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,12 +175,31 @@ enum IpcMessage {
         markdown: String,
     },
     Close,
+    SaveSettings {
+        settings: AppSettings,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ScrollMarker {
     section: Option<usize>,
     ratio: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppSettings {
+    theme_id: String,
+    custom_css: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            theme_id: "clean".to_string(),
+            custom_css: String::new(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -195,17 +232,19 @@ const THEMES: &[ThemeDefinition] = &[
     },
 ];
 
-fn build_app_html(markdown: &str) -> Result<String> {
+fn build_app_html(markdown: &str, settings: &AppSettings) -> Result<String> {
     let expanded_markdown = expand_toc_markers(markdown);
     let rendered = render_markdown_safely(&expanded_markdown);
     let markdown_json = serde_json::to_string(&expanded_markdown)?;
     let rendered_json = serde_json::to_string(&rendered)?;
     let themes_json = serde_json::to_string(THEMES)?;
+    let settings_json = serde_json::to_string(&normalize_settings(settings))?;
 
     Ok(APP_HTML_TEMPLATE
         .replace("__INITIAL_MARKDOWN__", &markdown_json)
         .replace("__INITIAL_RENDERED__", &rendered_json)
-        .replace("__THEMES__", &themes_json))
+        .replace("__THEMES__", &themes_json)
+        .replace("__SETTINGS__", &settings_json))
 }
 
 fn apply_rendered_html(
@@ -233,6 +272,90 @@ fn notify_save_finished(webview: &WebView, result: Result<()>) {
     let _ = webview.evaluate_script(&format!(
         "window.__mdReaderSaveFinished({ok}, {message_json});"
     ));
+}
+
+fn notify_settings_finished(webview: &WebView, result: Result<()>) {
+    let (ok, message) = match result {
+        Ok(()) => (true, String::new()),
+        Err(error) => (false, error.to_string()),
+    };
+    let message_json =
+        serde_json::to_string(&message).unwrap_or_else(|_| "\"settings save failed\"".into());
+    let _ = webview.evaluate_script(&format!(
+        "window.__mdReaderSettingsFinished({ok}, {message_json});"
+    ));
+}
+
+fn app_settings_path() -> PathBuf {
+    let base = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .or_else(|| {
+            env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|path| path.join("AppData").join("Roaming"))
+        })
+        .unwrap_or_else(env::temp_dir);
+    base.join("Markdown Reader").join("settings.json")
+}
+
+fn load_app_settings() -> AppSettings {
+    let path = app_settings_path();
+    let Ok(body) = fs::read_to_string(path) else {
+        return AppSettings::default();
+    };
+    serde_json::from_str::<AppSettings>(&body)
+        .map(|settings| normalize_settings(&settings))
+        .unwrap_or_default()
+}
+
+fn save_app_settings(path: &Path, settings: &AppSettings) -> Result<()> {
+    let settings = normalize_settings(settings);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create settings directory {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(&settings)?;
+    fs::write(path, body.as_bytes())
+        .with_context(|| format!("failed to save settings {}", path.display()))
+}
+
+fn normalize_settings(settings: &AppSettings) -> AppSettings {
+    let custom_css = sanitize_settings_css(
+        &settings
+            .custom_css
+            .chars()
+            .take(262_144)
+            .collect::<String>(),
+    );
+    let theme_id = if settings.theme_id == "custom" && !custom_css.trim().is_empty() {
+        "custom".to_string()
+    } else if THEMES.iter().any(|theme| theme.id == settings.theme_id) {
+        settings.theme_id.clone()
+    } else {
+        "clean".to_string()
+    };
+
+    AppSettings {
+        theme_id,
+        custom_css,
+    }
+}
+
+fn sanitize_settings_css(css: &str) -> String {
+    css.lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            !lower.contains("@import")
+                && !lower.contains("http://")
+                && !lower.contains("https://")
+                && !lower.contains("javascript:")
+                && !lower.contains("expression(")
+                && !lower.contains("behavior:")
+                && !lower.contains("-moz-binding")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,7 +637,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: file: http: https:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; connect-src 'none'; img-src data: file:; media-src data: file:; font-src data: file:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
   <style>
     :root {
       color-scheme: light;
@@ -984,6 +1107,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const initialMarkdown = __INITIAL_MARKDOWN__;
     const initialRendered = __INITIAL_RENDERED__;
     const themes = __THEMES__;
+    const initialSettings = __SETTINGS__;
     const editor = document.getElementById("editor");
     const rendered = document.getElementById("rendered");
     const toggle = document.getElementById("mode-toggle");
@@ -998,13 +1122,9 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const blockFormat = document.getElementById("block-format");
     const inlineCodeButton = document.getElementById("inline-code-button");
     const linkButton = document.getElementById("link-button");
-    const storageKeys = {
-      theme: "markdown-reader.theme",
-      customCss: "markdown-reader.custom-css"
-    };
     let dirty = false;
     let renderedDirty = false;
-    let customCss = loadStoredValue(storageKeys.customCss, "");
+    let customCss = sanitizeCustomCss(initialSettings.customCss || "");
     let savedRenderedRange = null;
 
     editor.value = initialMarkdown;
@@ -1012,24 +1132,6 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 
     function postMessage(payload) {
       window.ipc.postMessage(JSON.stringify(payload));
-    }
-
-    function loadStoredValue(key, fallback) {
-      try {
-        const value = localStorage.getItem(key);
-        return value === null ? fallback : value;
-      } catch (_error) {
-        return fallback;
-      }
-    }
-
-    function storeValue(key, value) {
-      try {
-        localStorage.setItem(key, value);
-      } catch (_error) {
-        // Some embedded WebView origins can reject storage. The setting still
-        // applies to the current window, so failure here is non-fatal.
-      }
     }
 
     function setDirty(value) {
@@ -1407,7 +1509,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       themeSelect.append(option);
     }
 
-    function applyTheme(themeId) {
+    function applyTheme(themeId, persist = true) {
       const fallback = themes[0];
       const selected = themes.find((theme) => theme.id === themeId) || fallback;
       if (themeId === "custom" && customCss) {
@@ -1417,7 +1519,27 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         themeStyle.textContent = selected.css;
         customThemeStyle.textContent = "";
       }
-      storeValue(storageKeys.theme, themeId);
+      if (persist) {
+        saveThemeSettings(themeId);
+      }
+    }
+
+    function saveThemeSettings(themeId) {
+      postMessage({
+        kind: "saveSettings",
+        settings: {
+          themeId,
+          customCss
+        }
+      });
+    }
+
+    function sanitizeCustomCss(css) {
+      return normalizeText(css)
+        .slice(0, 262144)
+        .split(/\r\n|\r|\n/)
+        .filter((line) => !/@import|https?:\/\/|javascript:|expression\s*\(|behavior:|-moz-binding/i.test(line))
+        .join("\n");
     }
 
     function openSettings() {
@@ -1531,6 +1653,12 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       alert(message || "Save failed.");
     };
 
+    window.__mdReaderSettingsFinished = (ok, message) => {
+      if (!ok) {
+        alert(message || "Settings save failed.");
+      }
+    };
+
     window.__mdReaderRequestClose = () => {
       if (!dirty || window.confirm("Close without saving changes?")) {
         postMessage({ kind: "close" });
@@ -1564,8 +1692,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       if (!file) {
         return;
       }
-      customCss = await file.text();
-      storeValue(storageKeys.customCss, customCss);
+      customCss = sanitizeCustomCss(await file.text());
       addCustomThemeOption();
       themeSelect.value = "custom";
       applyTheme("custom");
@@ -1632,11 +1759,11 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     });
 
     populateThemes();
-    const storedTheme = loadStoredValue(storageKeys.theme, "clean");
+    const storedTheme = initialSettings.themeId || "clean";
     const themeIsKnown = storedTheme === "custom" ? Boolean(customCss) : themes.some((theme) => theme.id === storedTheme);
     const initialTheme = themeIsKnown ? storedTheme : "clean";
     themeSelect.value = initialTheme;
-    applyTheme(initialTheme);
+    applyTheme(initialTheme, false);
     document.body.classList.remove("editing");
     toggle.checked = true;
     setDirty(false);
@@ -1668,19 +1795,25 @@ mod tests {
 
     #[test]
     fn app_html_includes_theme_and_control_data() {
-        let html = build_app_html("# One").expect("app html should render");
+        let html =
+            build_app_html("# One", &AppSettings::default()).expect("app html should render");
 
         assert!(!html.contains("__THEMES__"));
+        assert!(!html.contains("__SETTINGS__"));
         assert!(html.contains("save-button"));
         assert!(html.contains("settings-button"));
         assert!(html.contains("format-toolbar"));
         assert!(html.contains(r#"grid-template-rows: 34px minmax(0, 1fr)"#));
         assert!(html.contains("contenteditable=\"true\""));
+        assert!(html.contains(r#""themeId":"clean""#));
+        assert!(html.contains(r#"kind: "saveSettings""#));
+        assert!(!html.contains("localStorage"));
     }
 
     #[test]
     fn app_html_requires_explicit_save() {
-        let html = build_app_html("[toc]\n\n# One").expect("app html should render");
+        let html = build_app_html("[toc]\n\n# One", &AppSettings::default())
+            .expect("app html should render");
 
         assert!(html.contains("__mdReaderRequestClose"));
         assert!(html.contains("Close without saving changes?"));
@@ -1714,5 +1847,44 @@ mod tests {
     fn formatted_serializer_no_longer_uses_global_inline_escaping() {
         assert!(APP_HTML_TEMPLATE.contains("function protectParagraphMarkdown"));
         assert!(!APP_HTML_TEMPLATE.contains(r#"replace(/[\\`*_{}\[\]<>]/g"#));
+    }
+
+    #[test]
+    fn settings_default_unknown_themes_to_clean() {
+        let settings = normalize_settings(&AppSettings {
+            theme_id: "missing".to_string(),
+            custom_css: String::new(),
+        });
+
+        assert_eq!(settings.theme_id, "clean");
+        assert!(settings.custom_css.is_empty());
+    }
+
+    #[test]
+    fn settings_allow_custom_theme_only_with_css() {
+        let without_css = normalize_settings(&AppSettings {
+            theme_id: "custom".to_string(),
+            custom_css: String::new(),
+        });
+        let with_css = normalize_settings(&AppSettings {
+            theme_id: "custom".to_string(),
+            custom_css: "body { color: #123; }".to_string(),
+        });
+
+        assert_eq!(without_css.theme_id, "clean");
+        assert_eq!(with_css.theme_id, "custom");
+        assert_eq!(with_css.custom_css, "body { color: #123; }");
+    }
+
+    #[test]
+    fn settings_css_sanitizer_removes_remote_and_script_like_css() {
+        let settings = normalize_settings(&AppSettings {
+            theme_id: "custom".to_string(),
+            custom_css: "@import url('https://example.com/x.css');\nbody { color: #123; }\na { background: url(http://example.com/x.png); }\ndiv { width: expression(alert(1)); }"
+                .to_string(),
+        });
+
+        assert_eq!(settings.theme_id, "custom");
+        assert_eq!(settings.custom_css, "body { color: #123; }");
     }
 }
