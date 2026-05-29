@@ -1,4 +1,4 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{
     collections::HashMap,
@@ -1073,8 +1073,8 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         <path d="M8 21v-7h8v7"></path>
       </svg>
     </button>
-    <label class="switch" title="Toggle view">
-      <input id="mode-toggle" type="checkbox" aria-label="Toggle rendered Markdown view">
+    <label class="switch" title="Plaintext: Alt+Left. Formatted: Alt+Right.">
+      <input id="mode-toggle" type="checkbox" aria-label="Toggle rendered Markdown view" title="Plaintext: Alt+Left. Formatted: Alt+Right.">
       <span class="track"></span>
       <span class="thumb"></span>
     </label>
@@ -1297,6 +1297,21 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       document.body.classList.add("editing");
       toggle.checked = false;
       requestAnimationFrame(() => applyMarkerToEditor(marker));
+    }
+
+    function showRenderedView() {
+      if (toggle.checked) {
+        return;
+      }
+      toggle.checked = true;
+      switchToRendered();
+    }
+
+    function showPlaintextView() {
+      if (!toggle.checked) {
+        return;
+      }
+      switchToEditor();
     }
 
     function renderedToMarkdown() {
@@ -1747,6 +1762,14 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         event.preventDefault();
         saveCurrentDocument();
       }
+      if (event.altKey && !event.ctrlKey && !event.metaKey && event.key === "ArrowLeft") {
+        event.preventDefault();
+        showPlaintextView();
+      }
+      if (event.altKey && !event.ctrlKey && !event.metaKey && event.key === "ArrowRight") {
+        event.preventDefault();
+        showRenderedView();
+      }
       if (event.key === "Escape" && !settingsBackdrop.hidden) {
         event.preventDefault();
         closeSettings();
@@ -1816,6 +1839,9 @@ mod tests {
         assert!(html.contains("contenteditable=\"true\""));
         assert!(html.contains(r#""themeId":"clean""#));
         assert!(html.contains(r#"kind: "saveSettings""#));
+        assert!(html.contains("Plaintext: Alt+Left. Formatted: Alt+Right."));
+        assert!(html.contains("showPlaintextView"));
+        assert!(html.contains("showRenderedView"));
         assert!(!html.contains("localStorage"));
     }
 

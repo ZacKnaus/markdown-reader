@@ -10,12 +10,13 @@ cargo run -- path\to\file.md
 
 The app expects UTF-8 Markdown. Passing zero arguments or more than one positional argument exits with a usage error.
 
-Debug builds launched from a terminal keep the terminal attached for diagnostics. Use `cargo build --release` for a Windows GUI executable that opens without a background console window.
+Windows builds use the GUI subsystem, so launching `markdown-reader.exe` opens the app window without a background console window.
 
 ## Editing And Saving
 
 - Toggle off to edit the plaintext Markdown.
 - Toggle on to render the current editor contents.
+- Press `Alt+Left` for plaintext view or `Alt+Right` for formatted view.
 - Make small text edits directly in the formatted view when that is faster.
 - Use the formatted-view toolbar for headings, bold, italic, inline code, links, bullet lists, numbered lists, blockquotes, and code blocks.
 - Use the save button or press `Ctrl+S` to save.
