@@ -40,6 +40,8 @@ Add `[toc]` on its own line in plaintext mode to generate a table of contents fr
 
 Use the gear button to open settings. The app includes several built-in CSS themes and can import a custom `.css` file. Theme settings are stored outside the document at `%APPDATA%\Markdown Reader\settings.json` so the same theme follows you across opened Markdown files without registry writes.
 
+The app also writes the built-in theme CSS files to `%APPDATA%\Markdown Reader\themes`. The Custom CSS picker opens in that folder so those files can be used as starting templates.
+
 Rendered HTML is produced by `pulldown-cmark` and sanitized with `ammonia` before being inserted into the WebView. Raw scripts from Markdown are not kept in the rendered document. The WebView content security policy blocks network access, remote images, frames, and object/embed content; imported custom CSS is also filtered to remove remote imports and script-like legacy CSS patterns.
 
 ## Validation

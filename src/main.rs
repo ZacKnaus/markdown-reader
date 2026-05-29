@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use pulldown_cmark::{html, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use tao::{
     dpi::LogicalSize,
@@ -35,6 +36,9 @@ fn run() -> Result<()> {
     let markdown = fs::read_to_string(&input_path)
         .with_context(|| format!("failed to read {}", input_path.display()))?;
     let settings = load_app_settings();
+    if let Err(error) = export_builtin_theme_templates(&app_themes_path()) {
+        eprintln!("failed to write default theme templates: {error:#}");
+    }
     launch_window(input_path, markdown, settings)
 }
 
@@ -60,6 +64,7 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let settings_path = app_settings_path();
+    let themes_path = app_themes_path();
     let window_title = input_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -87,6 +92,9 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
             }
             Ok(IpcMessage::SaveSettings { settings }) => {
                 let _ = proxy.send_event(AppEvent::SaveSettings { settings });
+            }
+            Ok(IpcMessage::PickCustomCss) => {
+                let _ = proxy.send_event(AppEvent::PickCustomCss);
             }
             Err(error) => eprintln!("invalid IPC message: {error}"),
         };
@@ -153,6 +161,15 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
                     notify_settings_finished(webview, result);
                 }
             }
+            TaoEvent::UserEvent(AppEvent::PickCustomCss) => {
+                if let Some(webview) = webview.as_ref() {
+                    match pick_custom_css(&themes_path) {
+                        Ok(Some(css)) => notify_custom_css_picked(webview, Ok(css)),
+                        Ok(None) => {}
+                        Err(error) => notify_custom_css_picked(webview, Err(error)),
+                    }
+                }
+            }
             _ => {}
         }
     });
@@ -171,6 +188,7 @@ enum AppEvent {
     SaveSettings {
         settings: AppSettings,
     },
+    PickCustomCss,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +205,7 @@ enum IpcMessage {
     SaveSettings {
         settings: AppSettings,
     },
+    PickCustomCss,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -295,7 +314,19 @@ fn notify_settings_finished(webview: &WebView, result: Result<()>) {
     ));
 }
 
-fn app_settings_path() -> PathBuf {
+fn notify_custom_css_picked(webview: &WebView, result: Result<String>) {
+    let (ok, payload) = match result {
+        Ok(css) => (true, css),
+        Err(error) => (false, error.to_string()),
+    };
+    let payload_json =
+        serde_json::to_string(&payload).unwrap_or_else(|_| "\"custom CSS picker failed\"".into());
+    let _ = webview.evaluate_script(&format!(
+        "window.__mdReaderCustomCssPicked({ok}, {payload_json});"
+    ));
+}
+
+fn app_settings_dir() -> PathBuf {
     let base = env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| env::var_os("LOCALAPPDATA").map(PathBuf::from))
@@ -305,7 +336,15 @@ fn app_settings_path() -> PathBuf {
                 .map(|path| path.join("AppData").join("Roaming"))
         })
         .unwrap_or_else(env::temp_dir);
-    base.join("Markdown Reader").join("settings.json")
+    base.join("Markdown Reader")
+}
+
+fn app_settings_path() -> PathBuf {
+    app_settings_dir().join("settings.json")
+}
+
+fn app_themes_path() -> PathBuf {
+    app_settings_dir().join("themes")
 }
 
 fn load_app_settings() -> AppSettings {
@@ -327,6 +366,42 @@ fn save_app_settings(path: &Path, settings: &AppSettings) -> Result<()> {
     let body = serde_json::to_string_pretty(&settings)?;
     fs::write(path, body.as_bytes())
         .with_context(|| format!("failed to save settings {}", path.display()))
+}
+
+fn export_builtin_theme_templates(themes_path: &Path) -> Result<()> {
+    fs::create_dir_all(themes_path).with_context(|| {
+        format!(
+            "failed to create theme template directory {}",
+            themes_path.display()
+        )
+    })?;
+
+    for theme in THEMES {
+        let path = themes_path.join(format!("{}.css", theme.id));
+        if path.exists() {
+            continue;
+        }
+        fs::write(&path, theme.css.as_bytes())
+            .with_context(|| format!("failed to save theme template {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn pick_custom_css(themes_path: &Path) -> Result<Option<String>> {
+    export_builtin_theme_templates(themes_path)?;
+    let Some(path) = FileDialog::new()
+        .set_title("Choose custom Markdown theme CSS")
+        .set_directory(themes_path)
+        .add_filter("CSS", &["css"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+
+    fs::read_to_string(&path)
+        .with_context(|| format!("failed to read custom CSS {}", path.display()))
+        .map(Some)
 }
 
 fn normalize_settings(settings: &AppSettings) -> AppSettings {
@@ -1007,7 +1082,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     }
 
     .settings-body select,
-    .settings-body input[type="file"] {
+    .settings-button {
       width: 100%;
       min-height: 32px;
       color: var(--ink);
@@ -1016,6 +1091,15 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       border-radius: 4px;
       padding: 4px 8px;
       font: 14px/1.3 "Segoe UI", system-ui, sans-serif;
+    }
+
+    .settings-button {
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .settings-button:hover {
+      background: var(--frame);
     }
   </style>
   <style id="theme-style"></style>
@@ -1105,9 +1189,9 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
           Theme
           <select id="theme-select"></select>
         </label>
-        <label class="field" for="custom-css-input">
+        <label class="field" for="custom-css-button">
           Custom CSS
-          <input id="custom-css-input" type="file" accept=".css,text/css">
+          <button id="custom-css-button" class="settings-button" type="button">Choose CSS...</button>
         </label>
       </div>
     </section>
@@ -1125,7 +1209,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const settingsBackdrop = document.getElementById("settings-backdrop");
     const settingsClose = document.getElementById("settings-close");
     const themeSelect = document.getElementById("theme-select");
-    const customCssInput = document.getElementById("custom-css-input");
+    const customCssButton = document.getElementById("custom-css-button");
     const themeStyle = document.getElementById("theme-style");
     const customThemeStyle = document.getElementById("custom-theme-style");
     const blockFormat = document.getElementById("block-format");
@@ -1558,6 +1642,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       });
     }
 
+    function pickCustomCss() {
+      postMessage({ kind: "pickCustomCss" });
+    }
+
     function sanitizeCustomCss(css) {
       return normalizeText(css)
         .slice(0, 262144)
@@ -1683,6 +1771,17 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       }
     };
 
+    window.__mdReaderCustomCssPicked = (ok, payload) => {
+      if (!ok) {
+        alert(payload || "Custom CSS picker failed.");
+        return;
+      }
+      customCss = sanitizeCustomCss(payload);
+      addCustomThemeOption();
+      themeSelect.value = "custom";
+      applyTheme("custom");
+    };
+
     window.__mdReaderRequestClose = () => {
       if (!dirty || window.confirm("Close without saving changes?")) {
         postMessage({ kind: "close" });
@@ -1711,17 +1810,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       applyTheme(themeSelect.value);
     });
 
-    customCssInput.addEventListener("change", async () => {
-      const file = customCssInput.files && customCssInput.files[0];
-      if (!file) {
-        return;
-      }
-      customCss = sanitizeCustomCss(await file.text());
-      addCustomThemeOption();
-      themeSelect.value = "custom";
-      applyTheme("custom");
-      customCssInput.value = "";
-    });
+    customCssButton.addEventListener("click", pickCustomCss);
 
     document.querySelectorAll("[data-command]").forEach((button) => {
       button.addEventListener("mousedown", (event) => event.preventDefault());
@@ -1843,6 +1932,10 @@ mod tests {
         assert!(html.contains("Plaintext: Alt+Left. Formatted: Alt+Right."));
         assert!(html.contains("showPlaintextView"));
         assert!(html.contains("showRenderedView"));
+        assert!(html.contains("custom-css-button"));
+        assert!(html.contains("pickCustomCss"));
+        assert!(html.contains("__mdReaderCustomCssPicked"));
+        assert!(!html.contains("type=\"file\""));
         assert!(!html.contains("localStorage"));
     }
 
@@ -1931,5 +2024,34 @@ mod tests {
 
         assert_eq!(settings.theme_id, "custom");
         assert_eq!(settings.custom_css, "body { color: #123; }");
+    }
+
+    #[test]
+    fn exports_default_theme_templates_without_overwriting_existing_files() {
+        let themes_path =
+            env::temp_dir().join(format!("markdown-reader-theme-test-{}", std::process::id()));
+        if themes_path.exists() {
+            fs::remove_dir_all(&themes_path).expect("old theme test dir should be removable");
+        }
+
+        export_builtin_theme_templates(&themes_path).expect("theme templates should export");
+        for theme in THEMES {
+            let path = themes_path.join(format!("{}.css", theme.id));
+            assert!(path.exists(), "{} should exist", path.display());
+            assert_eq!(
+                fs::read_to_string(&path).expect("theme template should be readable"),
+                theme.css
+            );
+        }
+
+        let clean_path = themes_path.join("clean.css");
+        fs::write(&clean_path, "custom edit").expect("test theme should be writable");
+        export_builtin_theme_templates(&themes_path).expect("theme templates should export again");
+        assert_eq!(
+            fs::read_to_string(&clean_path).expect("test theme should be readable"),
+            "custom edit"
+        );
+
+        fs::remove_dir_all(&themes_path).expect("theme test dir should be removable");
     }
 }
