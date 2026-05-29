@@ -1,6 +1,6 @@
 # Markdown Reader
 
-A small Rust Windows desktop Markdown reader/editor. It opens exactly one Markdown file path, shows a large resizable WebView2 window, and starts in rendered Markdown view with a slim frame and a single side-to-side toggle for edit/view mode.
+A small Rust Windows desktop Markdown reader/editor. It opens exactly one Markdown file path, shows a large resizable WebView2 window, and starts in rendered Markdown view with a slim frame, save control, view/edit toggle, and settings button.
 
 ## Usage
 
@@ -14,8 +14,15 @@ The app expects UTF-8 Markdown. Passing zero arguments or more than one position
 
 - Toggle off to edit the plaintext Markdown.
 - Toggle on to render the current editor contents.
-- Press `Ctrl+S` to save.
+- Make small text edits directly in the formatted view when that is faster.
+- Use the save button or press `Ctrl+S` to save.
 - Closing the window autosaves the current editor contents before exit.
+
+Formatted-view edits are converted back to conservative Markdown when saving or switching to plaintext. That path preserves common structures such as headings, paragraphs, lists, blockquotes, code blocks, links, images, and tables, but it may normalize the original Markdown formatting.
+
+## Themes
+
+Use the gear button to open settings. The app includes several built-in CSS themes and can import a custom `.css` file for the current WebView profile. Theme choices are stored locally when the WebView storage backend allows it.
 
 Rendered HTML is produced by `pulldown-cmark` and sanitized with `ammonia` before being inserted into the WebView. Raw scripts from Markdown are not kept in the rendered document.
 

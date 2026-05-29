@@ -1,0 +1,19 @@
+:root {
+  color-scheme: light;
+  --frame: #f7f7f4;
+  --border: #d5d8d2;
+  --ink: #20231f;
+  --muted: #697067;
+  --track: #cfd5ca;
+  --thumb: #fffaf0;
+  --accent: #1f7a68;
+  --surface: #ffffff;
+  --code: #f2f3f0;
+  --dialog: #ffffff;
+  --dialog-shadow: rgba(0, 0, 0, 0.22);
+}
+
+#rendered {
+  max-width: 980px;
+  margin: 0 auto;
+}
