@@ -12,6 +12,14 @@ The app expects UTF-8 Markdown. Passing zero arguments or more than one position
 
 Windows builds use the GUI subsystem, so launching `markdown-reader.exe` opens the app window without a background console window.
 
+For a no-registry `Open with` entry that shows a friendly filename, build the Windows copy:
+
+```powershell
+.\scripts\build-windows.cmd --release
+```
+
+Use `target\release\Markdown Reader.exe` for the Windows picker. The plain Cargo binary remains `target\release\markdown-reader.exe`.
+
 ## Editing And Saving
 
 - Toggle off to edit the plaintext Markdown.

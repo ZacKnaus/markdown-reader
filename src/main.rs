@@ -1066,7 +1066,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       </button>
     </div>
     <div class="nav-spacer"></div>
-    <button id="save-button" class="icon-button saved" type="button" title="Save" aria-label="Save">
+    <button id="save-button" class="icon-button saved" type="button" title="Save (Ctrl+S)" aria-label="Save">
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M5 3h12l2 2v16H5z"></path>
         <path d="M8 3v6h8V3"></path>
@@ -1833,6 +1833,7 @@ mod tests {
         assert!(!html.contains("__THEMES__"));
         assert!(!html.contains("__SETTINGS__"));
         assert!(html.contains("save-button"));
+        assert!(html.contains("Save (Ctrl+S)"));
         assert!(html.contains("settings-button"));
         assert!(html.contains("format-toolbar"));
         assert!(html.contains(r#"grid-template-rows: 34px minmax(0, 1fr)"#));
