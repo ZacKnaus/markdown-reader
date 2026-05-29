@@ -13,12 +13,15 @@ use tao::{
     dpi::LogicalSize,
     event::{Event as TaoEvent, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
-    window::WindowBuilder,
+    window::{Icon, WindowBuilder},
 };
 use wry::{http::Request, NewWindowResponse, WebView, WebViewBuilder};
 
 const WINDOW_WIDTH: f64 = 1200.0;
 const WINDOW_HEIGHT: f64 = 900.0;
+const APP_ICON_WIDTH: u32 = 32;
+const APP_ICON_HEIGHT: u32 = 32;
+const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/app-icon-32.rgba");
 
 fn main() {
     if let Err(error) = run() {
@@ -48,6 +51,11 @@ fn parse_single_input_path() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+fn app_window_icon() -> Result<Icon> {
+    Icon::from_rgba(APP_ICON_RGBA.to_vec(), APP_ICON_WIDTH, APP_ICON_HEIGHT)
+        .context("failed to load runtime window icon")
+}
+
 fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -> Result<()> {
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -62,6 +70,7 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
         .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
         .with_decorations(true)
         .with_resizable(true)
+        .with_window_icon(Some(app_window_icon()?))
         .build(&event_loop)
         .context("failed to create application window")?;
 
@@ -1824,6 +1833,15 @@ mod tests {
     fn built_in_themes_are_embedded() {
         assert!(THEMES.len() >= 3);
         assert!(THEMES.iter().all(|theme| theme.css.contains(":root")));
+        assert!(THEMES.iter().all(|theme| !theme.css.contains("#rendered")));
+    }
+
+    #[test]
+    fn runtime_window_icon_bytes_match_declared_size() {
+        assert_eq!(
+            APP_ICON_RGBA.len(),
+            (APP_ICON_WIDTH * APP_ICON_HEIGHT * 4) as usize
+        );
     }
 
     #[test]

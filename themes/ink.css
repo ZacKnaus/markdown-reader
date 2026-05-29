@@ -12,8 +12,3 @@
   --dialog: #ffffff;
   --dialog-shadow: rgba(17, 24, 39, 0.22);
 }
-
-#rendered {
-  max-width: 1040px;
-  margin: 0 auto;
-}
