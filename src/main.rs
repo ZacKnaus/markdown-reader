@@ -107,6 +107,9 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
             Ok(IpcMessage::OpenLink { href, behavior }) => {
                 let _ = proxy.send_event(AppEvent::OpenLink { href, behavior });
             }
+            Ok(IpcMessage::GoBack) => {
+                let _ = proxy.send_event(AppEvent::GoBack);
+            }
             Err(error) => eprintln!("invalid IPC message: {error}"),
         };
 
@@ -120,6 +123,7 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
         .build(&window)
         .context("failed to create WebView2 surface")?;
     let mut webview = Some(webview);
+    let mut document_history = Vec::<PathBuf>::new();
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -187,7 +191,9 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                 }
             }
             TaoEvent::UserEvent(AppEvent::OpenLink { href, behavior }) => {
-                let result = if normalize_link_click_behavior(&behavior) == LINK_BEHAVIOR_NAVIGATE {
+                let behavior = normalize_link_click_behavior(&behavior);
+                let previous_path = input_path.clone();
+                let result = if behavior == LINK_BEHAVIOR_NAVIGATE {
                     navigate_to_link_target(
                         &mut input_path,
                         webview.as_ref(),
@@ -198,11 +204,51 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                 } else {
                     open_link_target(&input_path, &href, &current_settings)
                 };
-                if let Err(error) = result {
+                match result {
+                    Ok(()) => {
+                        if behavior == LINK_BEHAVIOR_NAVIGATE && input_path != previous_path {
+                            document_history.push(previous_path);
+                            if let Some(webview) = webview.as_ref() {
+                                notify_back_history_changed(webview, true);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(webview) = webview.as_ref() {
+                            notify_open_link_failed(webview, &error.to_string());
+                        } else {
+                            eprintln!("failed to open link: {error:#}");
+                        }
+                    }
+                }
+            }
+            TaoEvent::UserEvent(AppEvent::GoBack) => {
+                let Some(previous_path) = document_history.pop() else {
                     if let Some(webview) = webview.as_ref() {
-                        notify_open_link_failed(webview, &error.to_string());
-                    } else {
-                        eprintln!("failed to open link: {error:#}");
+                        notify_back_history_changed(webview, false);
+                    }
+                    return;
+                };
+
+                match load_document_path(
+                    &mut input_path,
+                    previous_path.clone(),
+                    webview.as_ref(),
+                    &window,
+                ) {
+                    Ok(()) => {
+                        if let Some(webview) = webview.as_ref() {
+                            notify_back_history_changed(webview, !document_history.is_empty());
+                        }
+                    }
+                    Err(error) => {
+                        document_history.push(previous_path);
+                        if let Some(webview) = webview.as_ref() {
+                            notify_back_history_changed(webview, !document_history.is_empty());
+                            notify_open_link_failed(webview, &error.to_string());
+                        } else {
+                            eprintln!("failed to go back: {error:#}");
+                        }
                     }
                 }
             }
@@ -229,6 +275,7 @@ enum AppEvent {
         href: String,
         behavior: String,
     },
+    GoBack,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +297,7 @@ enum IpcMessage {
         href: String,
         behavior: String,
     },
+    GoBack,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -390,6 +438,12 @@ fn notify_open_link_failed(webview: &WebView, message: &str) {
     let message_json =
         serde_json::to_string(message).unwrap_or_else(|_| "\"failed to open link\"".into());
     let _ = webview.evaluate_script(&format!("window.__mdReaderOpenLinkFailed({message_json});"));
+}
+
+fn notify_back_history_changed(webview: &WebView, can_go_back: bool) {
+    let _ = webview.evaluate_script(&format!(
+        "window.__mdReaderSetCanGoBack && window.__mdReaderSetCanGoBack({can_go_back});"
+    ));
 }
 
 fn app_settings_dir() -> PathBuf {
@@ -579,13 +633,22 @@ fn navigate_to_link_target(
         return open_link_target(current_path, href, settings);
     };
 
+    load_document_path(current_path, next_path, webview, window)
+}
+
+fn load_document_path(
+    current_path: &mut PathBuf,
+    next_path: PathBuf,
+    webview: Option<&WebView>,
+    window: &Window,
+) -> Result<()> {
+    let Some(webview) = webview else {
+        bail!("reader window is not available for navigation");
+    };
     let markdown = fs::read_to_string(&next_path)
         .with_context(|| format!("failed to read linked document {}", next_path.display()))?;
     let expanded_markdown = expand_toc_markers(&markdown);
     let rendered_html = render_markdown_safely(&expanded_markdown);
-    let Some(webview) = webview else {
-        bail!("reader window is not available for navigation");
-    };
 
     load_document_html(webview, &expanded_markdown, &rendered_html)?;
     *current_path = next_path;
@@ -1198,6 +1261,17 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       background: rgba(0, 0, 0, 0.04);
     }
 
+    .icon-button:disabled {
+      color: var(--muted);
+      cursor: default;
+      opacity: 0.46;
+    }
+
+    .icon-button:disabled:hover {
+      border-color: transparent;
+      background: transparent;
+    }
+
     .icon-button:focus-visible {
       outline: 2px solid #2d6cdf;
       outline-offset: 1px;
@@ -1558,6 +1632,12 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 </head>
 <body>
   <nav>
+    <button id="back-button" class="icon-button history-button" type="button" title="Back" aria-label="Back" disabled>
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M19 12H5"></path>
+        <path d="M12 19l-7-7 7-7"></path>
+      </svg>
+    </button>
     <div id="format-toolbar" class="format-tools" aria-label="Formatting">
       <select id="block-format" class="format-select" title="Block format" aria-label="Block format">
         <option value="p">P</option>
@@ -1669,6 +1749,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const editor = document.getElementById("editor");
     const rendered = document.getElementById("rendered");
     const toggle = document.getElementById("mode-toggle");
+    const backButton = document.getElementById("back-button");
     const saveButton = document.getElementById("save-button");
     const settingsButton = document.getElementById("settings-button");
     const settingsBackdrop = document.getElementById("settings-backdrop");
@@ -1705,6 +1786,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       dirty = value;
       saveButton.classList.toggle("dirty", dirty);
       saveButton.classList.toggle("saved", !dirty);
+    }
+
+    function setCanGoBack(value) {
+      backButton.disabled = !Boolean(value);
     }
 
     function markerFromEditor() {
@@ -2188,8 +2273,8 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       settingsButton.focus();
     }
 
-    function confirmNavigationIfNeeded() {
-      return !dirty || window.confirm("Navigate without saving changes?");
+    function confirmNavigationIfNeeded(message = "Navigate without saving changes?") {
+      return !dirty || window.confirm(message);
     }
 
     function openLinkWithBehavior(href, behavior) {
@@ -2199,6 +2284,14 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       }
       hideLinkMenu();
       postMessage({ kind: "openLink", href, behavior: normalizedBehavior });
+    }
+
+    function requestBack() {
+      if (backButton.disabled || !confirmNavigationIfNeeded("Go back without saving changes?")) {
+        return;
+      }
+      hideLinkMenu();
+      postMessage({ kind: "goBack" });
     }
 
     function showLinkMenu(href, event) {
@@ -2326,6 +2419,8 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       setDirty(false);
     };
 
+    window.__mdReaderSetCanGoBack = setCanGoBack;
+
     window.__mdReaderSaveFinished = (ok, message) => {
       if (ok) {
         setDirty(false);
@@ -2370,6 +2465,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     });
 
     saveButton.addEventListener("click", saveCurrentDocument);
+    backButton.addEventListener("click", requestBack);
 
     settingsButton.addEventListener("click", openSettings);
     settingsClose.addEventListener("click", closeSettings);
@@ -2498,6 +2594,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     applyTheme(initialTheme, false);
     document.body.classList.remove("editing");
     toggle.checked = true;
+    setCanGoBack(false);
     setDirty(false);
   </script>
 </body>
@@ -2532,6 +2629,12 @@ mod tests {
 
         assert!(!html.contains("__THEMES__"));
         assert!(!html.contains("__SETTINGS__"));
+        assert!(html.contains("back-button"));
+        assert!(html.contains(r#"title="Back""#));
+        assert!(html.contains(r#"kind: "goBack""#));
+        assert!(html.contains("requestBack"));
+        assert!(html.contains("__mdReaderSetCanGoBack"));
+        assert!(html.contains("Go back without saving changes?"));
         assert!(html.contains("save-button"));
         assert!(html.contains("Save (Ctrl+S)"));
         assert!(html.contains("settings-button"));

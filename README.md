@@ -33,7 +33,7 @@ The helper initializes Visual Studio Build Tools when they are installed but not
 
 Formatted-view edits are converted back to conservative Markdown when saving or switching to plaintext. That path preserves common structures such as headings, paragraphs, lists, blockquotes, code blocks, links, images, and tables, but it may normalize some original spacing.
 
-Click links in formatted view to open safe targets with the Windows default handler or navigate the current reader window, depending on the saved Link Click Behavior setting. Relative document links are resolved from the folder containing the opened Markdown file, internal `#heading` links scroll inside the reader, and local executable/script-like targets are blocked unless their extensions are added in Settings. Right-click a rendered link to use the alternate behavior for that link.
+Click links in formatted view to open safe targets with the Windows default handler or navigate the current reader window, depending on the saved Link Click Behavior setting. When navigating inside the current window, the Back button returns to the prior document in that window's history. Relative document links are resolved from the folder containing the opened Markdown file, internal `#heading` links scroll inside the reader, and local executable/script-like targets are blocked unless their extensions are added in Settings. Right-click a rendered link to use the alternate behavior for that link.
 
 ## Table Of Contents
 
