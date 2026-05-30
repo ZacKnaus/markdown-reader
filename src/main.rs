@@ -16,7 +16,7 @@ use tao::{
     dpi::LogicalSize,
     event::{Event as TaoEvent, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
-    window::{Icon, WindowBuilder},
+    window::{Icon, Window, WindowBuilder},
 };
 use wry::{http::Request, NewWindowResponse, WebView, WebViewBuilder};
 
@@ -25,6 +25,8 @@ const WINDOW_HEIGHT: f64 = 900.0;
 const APP_ICON_WIDTH: u32 = 32;
 const APP_ICON_HEIGHT: u32 = 32;
 const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/app-icon-32.rgba");
+const LINK_BEHAVIOR_NEW_WINDOW: &str = "newWindow";
+const LINK_BEHAVIOR_NAVIGATE: &str = "navigate";
 
 fn main() {
     if let Err(error) = run() {
@@ -62,16 +64,20 @@ fn app_window_icon() -> Result<Icon> {
         .context("failed to load runtime window icon")
 }
 
-fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -> Result<()> {
+fn window_title_for_path(input_path: &Path) -> String {
+    input_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("Markdown Reader - {name}"))
+        .unwrap_or_else(|| "Markdown Reader".to_string())
+}
+
+fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSettings) -> Result<()> {
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let settings_path = app_settings_path();
     let themes_path = app_themes_path();
-    let window_title = input_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| format!("Markdown Reader - {name}"))
-        .unwrap_or_else(|| "Markdown Reader".to_string());
+    let window_title = window_title_for_path(&input_path);
     let window = WindowBuilder::new()
         .with_title(window_title)
         .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
@@ -98,8 +104,8 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
             Ok(IpcMessage::PickCustomCss) => {
                 let _ = proxy.send_event(AppEvent::PickCustomCss);
             }
-            Ok(IpcMessage::OpenLink { href }) => {
-                let _ = proxy.send_event(AppEvent::OpenLink { href });
+            Ok(IpcMessage::OpenLink { href, behavior }) => {
+                let _ = proxy.send_event(AppEvent::OpenLink { href, behavior });
             }
             Err(error) => eprintln!("invalid IPC message: {error}"),
         };
@@ -180,8 +186,19 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
                     }
                 }
             }
-            TaoEvent::UserEvent(AppEvent::OpenLink { href }) => {
-                if let Err(error) = open_link_target(&input_path, &href, &current_settings) {
+            TaoEvent::UserEvent(AppEvent::OpenLink { href, behavior }) => {
+                let result = if normalize_link_click_behavior(&behavior) == LINK_BEHAVIOR_NAVIGATE {
+                    navigate_to_link_target(
+                        &mut input_path,
+                        webview.as_ref(),
+                        &window,
+                        &href,
+                        &current_settings,
+                    )
+                } else {
+                    open_link_target(&input_path, &href, &current_settings)
+                };
+                if let Err(error) = result {
                     if let Some(webview) = webview.as_ref() {
                         notify_open_link_failed(webview, &error.to_string());
                     } else {
@@ -210,6 +227,7 @@ enum AppEvent {
     PickCustomCss,
     OpenLink {
         href: String,
+        behavior: String,
     },
 }
 
@@ -230,6 +248,7 @@ enum IpcMessage {
     PickCustomCss,
     OpenLink {
         href: String,
+        behavior: String,
     },
 }
 
@@ -246,6 +265,8 @@ struct AppSettings {
     custom_css: String,
     #[serde(default)]
     allowed_launch_extensions: Vec<String>,
+    #[serde(default)]
+    link_click_behavior: String,
 }
 
 impl Default for AppSettings {
@@ -254,6 +275,7 @@ impl Default for AppSettings {
             theme_id: "clean".to_string(),
             custom_css: String::new(),
             allowed_launch_extensions: Vec::new(),
+            link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
         }
     }
 }
@@ -317,6 +339,16 @@ fn apply_rendered_html(
             "window.__mdReaderApplyRendered({html_json}, {markdown_json}, {marker_json});"
         ))
         .context("WebView2 rejected rendered markdown update")
+}
+
+fn load_document_html(webview: &WebView, markdown: &str, rendered_html: &str) -> Result<()> {
+    let markdown_json = serde_json::to_string(markdown)?;
+    let html_json = serde_json::to_string(rendered_html)?;
+    webview
+        .evaluate_script(&format!(
+            "window.__mdReaderLoadDocument({markdown_json}, {html_json});"
+        ))
+        .context("WebView2 rejected document navigation update")
 }
 
 fn notify_save_finished(webview: &WebView, result: Result<()>) {
@@ -460,6 +492,7 @@ fn normalize_settings(settings: &AppSettings) -> AppSettings {
         allowed_launch_extensions: normalize_allowed_launch_extensions(
             &settings.allowed_launch_extensions,
         ),
+        link_click_behavior: normalize_link_click_behavior(&settings.link_click_behavior),
     }
 }
 
@@ -520,10 +553,44 @@ fn normalize_launch_extension_token(token: &str) -> Option<String> {
     }
 }
 
+fn normalize_link_click_behavior(behavior: &str) -> String {
+    if behavior == LINK_BEHAVIOR_NAVIGATE {
+        LINK_BEHAVIOR_NAVIGATE.to_string()
+    } else {
+        LINK_BEHAVIOR_NEW_WINDOW.to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LinkTarget {
     Url(String),
     Document(PathBuf),
+}
+
+fn navigate_to_link_target(
+    current_path: &mut PathBuf,
+    webview: Option<&WebView>,
+    window: &Window,
+    href: &str,
+    settings: &AppSettings,
+) -> Result<()> {
+    let target = resolve_link_target_with_settings(current_path, href, settings)?;
+    let LinkTarget::Document(next_path) = target else {
+        return open_link_target(current_path, href, settings);
+    };
+
+    let markdown = fs::read_to_string(&next_path)
+        .with_context(|| format!("failed to read linked document {}", next_path.display()))?;
+    let expanded_markdown = expand_toc_markers(&markdown);
+    let rendered_html = render_markdown_safely(&expanded_markdown);
+    let Some(webview) = webview else {
+        bail!("reader window is not available for navigation");
+    };
+
+    load_document_html(webview, &expanded_markdown, &rendered_html)?;
+    *current_path = next_path;
+    window.set_title(&window_title_for_path(current_path));
+    Ok(())
 }
 
 fn open_link_target(document_path: &Path, href: &str, settings: &AppSettings) -> Result<()> {
@@ -556,8 +623,9 @@ fn resolve_link_target_with_settings(
     if let Some(scheme) = href_scheme(trimmed) {
         return match scheme.to_ascii_lowercase().as_str() {
             "file" => {
-                ensure_file_url_is_launchable(trimmed, &settings)?;
-                Ok(LinkTarget::Url(trimmed.to_string()))
+                let file_path = file_url_to_path(trimmed)?;
+                ensure_document_path_is_launchable(&file_path, &settings)?;
+                Ok(LinkTarget::Document(file_path))
             }
             "http" | "https" | "mailto" => Ok(LinkTarget::Url(trimmed.to_string())),
             _ => bail!("blocked unsupported link scheme: {scheme}"),
@@ -580,10 +648,39 @@ fn resolve_link_target_with_settings(
     }
 }
 
-fn ensure_file_url_is_launchable(href: &str, settings: &AppSettings) -> Result<()> {
-    let path_part = strip_link_fragment_and_query(href);
+fn file_url_to_path(href: &str) -> Result<PathBuf> {
+    let path_part = strip_link_fragment_and_query(
+        href.strip_prefix("file:")
+            .context("file URL should include a file: scheme")?,
+    );
     let decoded = percent_decode_path(path_part)?;
-    ensure_document_path_is_launchable(Path::new(&decoded), settings)
+    if decoded.trim().is_empty() {
+        bail!("file URL does not include a document path");
+    }
+
+    #[cfg(windows)]
+    {
+        let path_text = if let Some(path) = decoded.strip_prefix("///") {
+            path.to_string()
+        } else if let Some(path) = decoded.strip_prefix("//") {
+            format!(r"\\{path}")
+        } else if let Some(path) = decoded.strip_prefix('/') {
+            path.to_string()
+        } else {
+            decoded
+        };
+        return Ok(PathBuf::from(path_text.replace('/', "\\")));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let path_text = decoded
+            .strip_prefix("//")
+            .or_else(|| decoded.strip_prefix('/'))
+            .unwrap_or(&decoded)
+            .to_string();
+        Ok(PathBuf::from(path_text))
+    }
 }
 
 fn ensure_document_path_is_launchable(path: &Path, settings: &AppSettings) -> Result<()> {
@@ -1250,6 +1347,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       box-shadow: inset 0 0 0 2px rgba(45, 108, 223, 0.35);
     }
 
+    #rendered a {
+      cursor: pointer;
+    }
+
     body.editing #editor {
       display: block;
     }
@@ -1421,6 +1522,36 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     .settings-button:hover {
       background: var(--frame);
     }
+
+    .link-menu {
+      position: fixed;
+      z-index: 20;
+      min-width: 188px;
+      padding: 4px;
+      background: var(--dialog, var(--surface));
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      box-shadow: 0 12px 28px var(--dialog-shadow, rgba(0, 0, 0, 0.22));
+    }
+
+    .link-menu button {
+      width: 100%;
+      min-height: 30px;
+      padding: 5px 8px;
+      color: var(--ink);
+      background: transparent;
+      border: 0;
+      border-radius: 3px;
+      text-align: left;
+      font: 13px/1.35 "Segoe UI", system-ui, sans-serif;
+      cursor: pointer;
+    }
+
+    .link-menu button:hover,
+    .link-menu button:focus-visible {
+      background: var(--frame);
+      outline: 0;
+    }
   </style>
   <style id="theme-style"></style>
   <style id="custom-theme-style"></style>
@@ -1509,6 +1640,13 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
           Theme
           <select id="theme-select"></select>
         </label>
+        <label class="field" for="link-click-behavior">
+          Link Click Behavior
+          <select id="link-click-behavior">
+            <option value="newWindow">New window</option>
+            <option value="navigate">Navigate</option>
+          </select>
+        </label>
         <label class="field" for="custom-css-button">
           Custom CSS
           <button id="custom-css-button" class="settings-button" type="button">Choose CSS...</button>
@@ -1519,6 +1657,9 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         </label>
       </div>
     </section>
+  </div>
+  <div id="link-menu" class="link-menu" hidden>
+    <button id="link-menu-action" type="button"></button>
   </div>
   <script>
     const initialMarkdown = __INITIAL_MARKDOWN__;
@@ -1533,8 +1674,11 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const settingsBackdrop = document.getElementById("settings-backdrop");
     const settingsClose = document.getElementById("settings-close");
     const themeSelect = document.getElementById("theme-select");
+    const linkClickBehaviorSelect = document.getElementById("link-click-behavior");
     const customCssButton = document.getElementById("custom-css-button");
     const allowedLaunchExtensionsInput = document.getElementById("allowed-launch-extensions");
+    const linkMenu = document.getElementById("link-menu");
+    const linkMenuAction = document.getElementById("link-menu-action");
     const themeStyle = document.getElementById("theme-style");
     const customThemeStyle = document.getElementById("custom-theme-style");
     const blockFormat = document.getElementById("block-format");
@@ -1544,11 +1688,14 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     let renderedDirty = false;
     let customCss = sanitizeCustomCss(initialSettings.customCss || "");
     let allowedLaunchExtensions = sanitizeAllowedLaunchExtensions(initialSettings.allowedLaunchExtensions || []);
+    let linkClickBehavior = normalizeLinkClickBehavior(initialSettings.linkClickBehavior);
+    let linkMenuHref = "";
     let savedRenderedRange = null;
 
     editor.value = initialMarkdown;
     rendered.innerHTML = initialRendered;
     allowedLaunchExtensionsInput.value = formatAllowedLaunchExtensions(allowedLaunchExtensions);
+    linkClickBehaviorSelect.value = linkClickBehavior;
 
     function postMessage(payload) {
       window.ipc.postMessage(JSON.stringify(payload));
@@ -1960,12 +2107,14 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     }
 
     function saveSettings(themeId) {
+      linkClickBehavior = normalizeLinkClickBehavior(linkClickBehaviorSelect.value);
       postMessage({
         kind: "saveSettings",
         settings: {
           themeId,
           customCss,
-          allowedLaunchExtensions
+          allowedLaunchExtensions,
+          linkClickBehavior
         }
       });
     }
@@ -2004,13 +2153,32 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       return extensions.map((extension) => `.${extension}`).join(", ");
     }
 
+    function normalizeLinkClickBehavior(value) {
+      return value === "navigate" ? "navigate" : "newWindow";
+    }
+
+    function alternateLinkBehavior() {
+      return linkClickBehavior === "navigate" ? "newWindow" : "navigate";
+    }
+
+    function linkBehaviorLabel(behavior) {
+      return behavior === "navigate" ? "Navigate" : "Open in new window";
+    }
+
     function saveAllowedLaunchExtensions() {
       allowedLaunchExtensions = sanitizeAllowedLaunchExtensions(allowedLaunchExtensionsInput.value);
       allowedLaunchExtensionsInput.value = formatAllowedLaunchExtensions(allowedLaunchExtensions);
       saveSettings(themeSelect.value);
     }
 
+    function saveLinkClickBehavior() {
+      linkClickBehavior = normalizeLinkClickBehavior(linkClickBehaviorSelect.value);
+      linkClickBehaviorSelect.value = linkClickBehavior;
+      saveSettings(themeSelect.value);
+    }
+
     function openSettings() {
+      hideLinkMenu();
       settingsBackdrop.hidden = false;
       themeSelect.focus();
     }
@@ -2018,6 +2186,39 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     function closeSettings() {
       settingsBackdrop.hidden = true;
       settingsButton.focus();
+    }
+
+    function confirmNavigationIfNeeded() {
+      return !dirty || window.confirm("Navigate without saving changes?");
+    }
+
+    function openLinkWithBehavior(href, behavior) {
+      const normalizedBehavior = normalizeLinkClickBehavior(behavior);
+      if (normalizedBehavior === "navigate" && !confirmNavigationIfNeeded()) {
+        return;
+      }
+      hideLinkMenu();
+      postMessage({ kind: "openLink", href, behavior: normalizedBehavior });
+    }
+
+    function showLinkMenu(href, event) {
+      if (!href.trim()) {
+        return;
+      }
+      linkMenuHref = href;
+      const behavior = alternateLinkBehavior();
+      linkMenuAction.textContent = linkBehaviorLabel(behavior);
+      linkMenu.hidden = false;
+      const width = linkMenu.offsetWidth || 188;
+      const height = linkMenu.offsetHeight || 38;
+      linkMenu.style.left = `${Math.max(4, Math.min(event.clientX, window.innerWidth - width - 4))}px`;
+      linkMenu.style.top = `${Math.max(4, Math.min(event.clientY, window.innerHeight - height - 4))}px`;
+      linkMenuAction.focus();
+    }
+
+    function hideLinkMenu() {
+      linkMenu.hidden = true;
+      linkMenuHref = "";
     }
 
     function markRenderedEdited() {
@@ -2113,6 +2314,18 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       requestAnimationFrame(() => applyMarkerToRendered(marker));
     };
 
+    window.__mdReaderLoadDocument = (expandedMarkdown, html) => {
+      hideLinkMenu();
+      editor.value = expandedMarkdown;
+      rendered.innerHTML = html;
+      renderedDirty = false;
+      document.body.classList.remove("editing");
+      toggle.checked = true;
+      editor.scrollTop = 0;
+      rendered.scrollTop = 0;
+      setDirty(false);
+    };
+
     window.__mdReaderSaveFinished = (ok, message) => {
       if (ok) {
         setDirty(false);
@@ -2170,6 +2383,8 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       applyTheme(themeSelect.value);
     });
 
+    linkClickBehaviorSelect.addEventListener("change", saveLinkClickBehavior);
+
     customCssButton.addEventListener("click", pickCustomCss);
     allowedLaunchExtensionsInput.addEventListener("change", saveAllowedLaunchExtensions);
 
@@ -2224,6 +2439,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         event.preventDefault();
         closeSettings();
       }
+      if (event.key === "Escape" && !linkMenu.hidden) {
+        event.preventDefault();
+        hideLinkMenu();
+      }
     });
 
     rendered.addEventListener("click", (event) => {
@@ -2237,16 +2456,45 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
             rendered.scrollTop = Math.max(0, target.offsetTop - 28);
           }
         } else if (href.trim()) {
-          postMessage({ kind: "openLink", href });
+          openLinkWithBehavior(href, linkClickBehavior);
         }
       }
     });
+
+    rendered.addEventListener("contextmenu", (event) => {
+      const anchor = event.target.closest("a");
+      if (!anchor) {
+        return;
+      }
+      event.preventDefault();
+      const href = anchor.getAttribute("href") || "";
+      if (href.startsWith('#')) {
+        return;
+      }
+      showLinkMenu(href, event);
+    });
+
+    linkMenuAction.addEventListener("click", () => {
+      if (linkMenuHref) {
+        openLinkWithBehavior(linkMenuHref, alternateLinkBehavior());
+      }
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!linkMenu.hidden && !linkMenu.contains(event.target)) {
+        hideLinkMenu();
+      }
+    });
+
+    rendered.addEventListener("scroll", hideLinkMenu);
+    window.addEventListener("resize", hideLinkMenu);
 
     populateThemes();
     const storedTheme = initialSettings.themeId || "clean";
     const themeIsKnown = storedTheme === "custom" ? Boolean(customCss) : themes.some((theme) => theme.id === storedTheme);
     const initialTheme = themeIsKnown ? storedTheme : "clean";
     themeSelect.value = initialTheme;
+    linkClickBehaviorSelect.value = linkClickBehavior;
     applyTheme(initialTheme, false);
     document.body.classList.remove("editing");
     toggle.checked = true;
@@ -2300,6 +2548,13 @@ mod tests {
         assert!(html.contains("__mdReaderCustomCssPicked"));
         assert!(html.contains("allowed-launch-extensions"));
         assert!(html.contains("allowedLaunchExtensions"));
+        assert!(html.contains("link-click-behavior"));
+        assert!(html.contains("linkClickBehavior"));
+        assert!(html.contains("#rendered a"));
+        assert!(html.contains("cursor: pointer"));
+        assert!(html.contains("__mdReaderLoadDocument"));
+        assert!(html.contains("link-menu-action"));
+        assert!(html.contains("contextmenu"));
         assert!(html.contains("openLink"));
         assert!(html.contains("__mdReaderOpenLinkFailed"));
         assert!(!html.contains("type=\"file\""));
@@ -2360,11 +2615,13 @@ mod tests {
             theme_id: "missing".to_string(),
             custom_css: String::new(),
             allowed_launch_extensions: Vec::new(),
+            link_click_behavior: "missing".to_string(),
         });
 
         assert_eq!(settings.theme_id, "clean");
         assert!(settings.custom_css.is_empty());
         assert!(settings.allowed_launch_extensions.is_empty());
+        assert_eq!(settings.link_click_behavior, LINK_BEHAVIOR_NEW_WINDOW);
     }
 
     #[test]
@@ -2373,11 +2630,13 @@ mod tests {
             theme_id: "custom".to_string(),
             custom_css: String::new(),
             allowed_launch_extensions: Vec::new(),
+            link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
         });
         let with_css = normalize_settings(&AppSettings {
             theme_id: "custom".to_string(),
             custom_css: "body { color: #123; }".to_string(),
             allowed_launch_extensions: Vec::new(),
+            link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
         });
 
         assert_eq!(without_css.theme_id, "clean");
@@ -2392,6 +2651,7 @@ mod tests {
             custom_css: "@import url('https://example.com/x.css');\nbody { color: #123; }\na { background: url(http://example.com/x.png); }\ndiv { width: expression(alert(1)); }"
                 .to_string(),
             allowed_launch_extensions: Vec::new(),
+            link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
         });
 
         assert_eq!(settings.theme_id, "custom");
@@ -2409,12 +2669,26 @@ mod tests {
                 "cmd".to_string(),
                 ".cmd".to_string(),
             ],
+            link_click_behavior: LINK_BEHAVIOR_NAVIGATE.to_string(),
         });
 
         assert_eq!(
             settings.allowed_launch_extensions,
             vec!["exe".to_string(), "ps1".to_string(), "cmd".to_string()]
         );
+        assert_eq!(settings.link_click_behavior, LINK_BEHAVIOR_NAVIGATE);
+    }
+
+    #[test]
+    fn settings_normalize_unknown_link_click_behavior_to_new_window() {
+        let settings = normalize_settings(&AppSettings {
+            theme_id: "clean".to_string(),
+            custom_css: String::new(),
+            allowed_launch_extensions: Vec::new(),
+            link_click_behavior: "sideways".to_string(),
+        });
+
+        assert_eq!(settings.link_click_behavior, LINK_BEHAVIOR_NEW_WINDOW);
     }
 
     #[test]
@@ -2446,7 +2720,7 @@ mod tests {
         assert_eq!(
             resolve_link_target(Path::new("C:/Docs/source.md"), "file:///C:/Docs/other.md")
                 .expect("file links should be launchable"),
-            LinkTarget::Url("file:///C:/Docs/other.md".to_string())
+            LinkTarget::Document(PathBuf::from("C:\\Docs\\other.md"))
         );
     }
 
@@ -2473,6 +2747,7 @@ mod tests {
             theme_id: "clean".to_string(),
             custom_css: String::new(),
             allowed_launch_extensions: vec!["exe".to_string(), "ps1".to_string()],
+            link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
         };
 
         assert_eq!(
@@ -2491,7 +2766,15 @@ mod tests {
                 &settings
             )
             .expect("configured file URL extension should be launchable"),
-            LinkTarget::Url("file:///C:/Docs/run.ps1".to_string())
+            LinkTarget::Document(PathBuf::from("C:\\Docs\\run.ps1"))
+        );
+    }
+
+    #[test]
+    fn file_urls_decode_to_windows_document_paths() {
+        assert_eq!(
+            file_url_to_path("file:///C:/Docs/Other%20Document.md").expect("file URL should parse"),
+            PathBuf::from("C:\\Docs\\Other Document.md")
         );
     }
 
