@@ -34,6 +34,11 @@ const LINK_BEHAVIOR_NAVIGATE: &str = "navigate";
 const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 3;
 const REMOTE_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const REMOTE_IMAGE_MAX_PER_WINDOW: usize = 64;
+const DEFAULT_ALLOWED_LAUNCH_EXTENSIONS: &[&str] = &[
+    "bmp", "csv", "doc", "docx", "gif", "htm", "html", "jpeg", "jpg", "json", "log", "md",
+    "markdown", "odp", "ods", "odt", "pdf", "png", "ppt", "pptx", "rtf", "toml", "tsv", "txt",
+    "webp", "xls", "xlsx", "xml", "yaml", "yml",
+];
 const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &["bmp", "gif", "jpeg", "jpg", "png", "webp"];
 const TRANSPARENT_GIF: &[u8] = &[
     0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xff, 0xff, 0xff,
@@ -1086,12 +1091,21 @@ fn ensure_document_path_is_launchable(path: &Path, settings: &AppSettings) -> Re
         .allowed_launch_extensions
         .iter()
         .any(|allowed| allowed == &extension)
+        || DEFAULT_ALLOWED_LAUNCH_EXTENSIONS.contains(&extension.as_str())
     {
         return Ok(());
     }
 
-    if matches!(
-        extension.as_str(),
+    if is_blocked_launch_extension(&extension) {
+        bail!("blocked potentially executable link target: .{extension}");
+    }
+
+    bail!("blocked link target extension that is not allowed by default: .{extension}")
+}
+
+fn is_blocked_launch_extension(extension: &str) -> bool {
+    matches!(
+        extension,
         "bat"
             | "cmd"
             | "com"
@@ -1099,12 +1113,14 @@ fn ensure_document_path_is_launchable(path: &Path, settings: &AppSettings) -> Re
             | "exe"
             | "hta"
             | "jar"
+            | "js"
             | "jse"
             | "lnk"
             | "msi"
             | "msp"
             | "ps1"
             | "psm1"
+            | "py"
             | "reg"
             | "scr"
             | "url"
@@ -1112,11 +1128,7 @@ fn ensure_document_path_is_launchable(path: &Path, settings: &AppSettings) -> Re
             | "vbs"
             | "wsf"
             | "wsh"
-    ) {
-        bail!("blocked potentially executable link target: .{extension}");
-    }
-
-    Ok(())
+    )
 }
 
 fn href_scheme(href: &str) -> Option<&str> {
@@ -2029,10 +2041,20 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       display: flex;
       align-items: center;
       gap: 4px;
+      min-width: 0;
+      max-width: min(820px, calc(100vw - 184px));
+      overflow-x: auto;
+      scrollbar-width: thin;
     }
 
     body.editing .format-tools {
       display: none;
+    }
+
+    .format-tools .icon-button,
+    .format-tools .format-select,
+    .format-tools .format-divider {
+      flex: 0 0 auto;
     }
 
     .format-select {
@@ -2059,6 +2081,15 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 
     .format-button.italic-label {
       font-style: italic;
+    }
+
+    .strike-label {
+      text-decoration: line-through;
+    }
+
+    .script-label {
+      font-size: 12px;
+      line-height: 1;
     }
 
     .switch {
@@ -2260,7 +2291,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       z-index: 10;
     }
 
-    .settings-modal {
+    .settings-modal,
+    .insert-modal {
       width: min(420px, calc(100vw - 32px));
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -2269,7 +2301,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       color: var(--ink);
     }
 
-    .settings-header {
+    .settings-header,
+    .insert-header {
       height: 42px;
       display: flex;
       align-items: center;
@@ -2278,13 +2311,15 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       border-bottom: 1px solid var(--border);
     }
 
-    .settings-header h2 {
+    .settings-header h2,
+    .insert-header h2 {
       font-size: 15px;
       font-weight: 600;
       margin: 0;
     }
 
-    .settings-body {
+    .settings-body,
+    .insert-body {
       display: grid;
       gap: 16px;
       padding: 16px;
@@ -2353,6 +2388,9 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 
 	    .settings-body select,
 	    .settings-body textarea,
+    .insert-body input,
+    .insert-body select,
+    .insert-body textarea,
     .settings-button {
       width: 100%;
       min-height: 32px;
@@ -2364,11 +2402,51 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       font: 14px/1.3 "Segoe UI", system-ui, sans-serif;
     }
 
-    .settings-body textarea {
+    .settings-body textarea,
+    .insert-body textarea {
       min-height: 68px;
       resize: vertical;
       font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
       line-height: 1.45;
+    }
+
+    .insert-body input[type="number"] {
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+
+    .insert-fields {
+      display: grid;
+      gap: 12px;
+    }
+
+    .form-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .form-button {
+      min-width: 84px;
+      min-height: 32px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 12px;
+      color: var(--ink);
+      background: var(--surface);
+      font: 14px/1.3 "Segoe UI", system-ui, sans-serif;
+      cursor: pointer;
+    }
+
+    .form-button:hover,
+    .form-button:focus-visible {
+      background: var(--frame);
+      outline: 0;
+    }
+
+    .form-button.primary {
+      color: #ffffff;
+      background: var(--accent);
+      border-color: var(--accent);
     }
 
     .settings-button {
@@ -2434,11 +2512,22 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       <span class="format-divider"></span>
       <button class="icon-button format-button" type="button" data-command="bold" title="Bold" aria-label="Bold">B</button>
       <button class="icon-button format-button italic-label" type="button" data-command="italic" title="Italic" aria-label="Italic">I</button>
+      <button class="icon-button format-button" type="button" data-command="strikeThrough" title="Strikethrough" aria-label="Strikethrough"><span class="strike-label">S</span></button>
+      <button class="icon-button format-button script-label" type="button" data-command="subscript" title="Subscript" aria-label="Subscript">x<sub>2</sub></button>
+      <button class="icon-button format-button script-label" type="button" data-command="superscript" title="Superscript" aria-label="Superscript">x<sup>2</sup></button>
       <button id="inline-code-button" class="icon-button format-button" type="button" title="Inline code" aria-label="Inline code">{}</button>
+      <button id="math-button" class="icon-button format-button" type="button" title="Math" aria-label="Math">{x}</button>
       <button id="link-button" class="icon-button" type="button" title="Link" aria-label="Link">
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path>
           <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"></path>
+        </svg>
+      </button>
+      <button id="image-button" class="icon-button" type="button" title="Image" aria-label="Image">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 5h16v14H4z"></path>
+          <path d="m8 14 2.5-3 3 4 2-2.5L20 18"></path>
+          <circle cx="8.5" cy="9" r="1"></circle>
         </svg>
       </button>
       <span class="format-divider"></span>
@@ -2462,6 +2551,15 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	          <path d="M4 14h2l-2 4h2"></path>
 	        </svg>
 	      </button>
+      <button id="task-list-button" class="icon-button" type="button" title="Task list" aria-label="Task list">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 5h4v4H4z"></path>
+          <path d="m5 7 1 1 2-2"></path>
+          <path d="M11 7h9"></path>
+          <path d="M4 15h4v4H4z"></path>
+          <path d="M11 17h9"></path>
+        </svg>
+      </button>
 	      <button id="table-button" class="icon-button" type="button" title="Table" aria-label="Table">
 	        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
 	          <path d="M4 5h16v14H4z"></path>
@@ -2471,6 +2569,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	          <path d="M16 5v14"></path>
 	        </svg>
 	      </button>
+      <button id="definition-list-button" class="icon-button format-button" type="button" title="Definition list" aria-label="Definition list">DL</button>
+      <button id="footnote-button" class="icon-button format-button" type="button" title="Footnote" aria-label="Footnote">fn</button>
 	    </div>
     <div class="nav-spacer"></div>
     <button id="save-button" class="icon-button saved" type="button" title="Save (Ctrl+S)" aria-label="Save">
@@ -2532,12 +2632,32 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	            Allowed Link Extensions
 	            <span class="help-wrap">
 	              <button id="allowed-extensions-help" class="icon-button help-button" type="button" aria-label="Show default allowed link extensions" aria-describedby="allowed-extensions-help-text" aria-expanded="false">?</button>
-	              <span id="allowed-extensions-help-text" class="help-tooltip" role="tooltip">Allowed by default: links with no extension and extensions that are not executable or script-like (.bat, .cmd, .com, .cpl, .exe, .hta, .jar, .jse, .lnk, .msi, .msp, .ps1, .psm1, .reg, .scr, .url, .vbe, .vbs, .wsf, .wsh).</span>
+	              <span id="allowed-extensions-help-text" class="help-tooltip" role="tooltip">Allowed by default: no extension, .bmp, .csv, .doc, .docx, .gif, .htm, .html, .jpeg, .jpg, .json, .log, .md, .markdown, .odp, .ods, .odt, .pdf, .png, .ppt, .pptx, .rtf, .toml, .tsv, .txt, .webp, .xls, .xlsx, .xml, .yaml, .yml.</span>
 	            </span>
 	          </span>
 	          <textarea id="allowed-launch-extensions" spellcheck="false" placeholder=".ps1, .exe"></textarea>
 	        </label>
       </div>
+    </section>
+  </div>
+  <div id="insert-backdrop" class="modal-backdrop" hidden>
+    <section class="insert-modal" role="dialog" aria-modal="true" aria-labelledby="insert-title">
+      <header class="insert-header">
+        <h2 id="insert-title">Insert</h2>
+        <button id="insert-close" class="icon-button" type="button" title="Close" aria-label="Close insert dialog">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18"></path>
+            <path d="m6 6 12 12"></path>
+          </svg>
+        </button>
+      </header>
+      <form id="insert-form" class="insert-body">
+        <div id="insert-fields" class="insert-fields"></div>
+        <footer class="form-actions">
+          <button id="insert-cancel" class="form-button" type="button">Cancel</button>
+          <button id="insert-submit" class="form-button primary" type="submit">Insert</button>
+        </footer>
+      </form>
     </section>
   </div>
   <div id="link-menu" class="link-menu" hidden>
@@ -2556,6 +2676,13 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     const settingsButton = document.getElementById("settings-button");
     const settingsBackdrop = document.getElementById("settings-backdrop");
     const settingsClose = document.getElementById("settings-close");
+    const insertBackdrop = document.getElementById("insert-backdrop");
+    const insertClose = document.getElementById("insert-close");
+    const insertCancel = document.getElementById("insert-cancel");
+    const insertForm = document.getElementById("insert-form");
+    const insertFields = document.getElementById("insert-fields");
+    const insertTitle = document.getElementById("insert-title");
+    const insertSubmit = document.getElementById("insert-submit");
 	    const themeSelect = document.getElementById("theme-select");
 	    const linkClickBehaviorSelect = document.getElementById("link-click-behavior");
 	    const allowRemoteImagesInput = document.getElementById("allow-remote-images");
@@ -2570,7 +2697,12 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     const blockFormat = document.getElementById("block-format");
 	    const inlineCodeButton = document.getElementById("inline-code-button");
 	    const linkButton = document.getElementById("link-button");
+	    const imageButton = document.getElementById("image-button");
+	    const mathButton = document.getElementById("math-button");
+	    const taskListButton = document.getElementById("task-list-button");
 	    const tableButton = document.getElementById("table-button");
+	    const definitionListButton = document.getElementById("definition-list-button");
+	    const footnoteButton = document.getElementById("footnote-button");
     let dirty = false;
     let renderedDirty = false;
 	    let customCss = sanitizeCustomCss(initialSettings.customCss || "");
@@ -2578,6 +2710,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	    let linkClickBehavior = normalizeLinkClickBehavior(initialSettings.linkClickBehavior);
 	    let allowRemoteImages = Boolean(initialSettings.allowRemoteImages);
     let linkMenuHref = "";
+    let insertKind = "";
+    let insertReturnFocus = null;
     let savedRenderedRange = null;
 
     editor.value = initialMarkdown;
@@ -3317,49 +3451,231 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       markRenderedEdited();
     }
 
-	    function applyLink() {
-	      restoreRenderedSelection();
-	      const url = window.prompt("URL");
-	      if (!url) {
-	        return;
+    function openInsertForm(kind, returnFocus = null) {
+      saveRenderedSelection();
+      hideLinkMenu();
+      insertKind = kind;
+      insertReturnFocus = returnFocus;
+      const selectedText = selectedRenderedText();
+      const defaults = {
+        link: {
+          title: "Insert Link",
+          submit: "Insert",
+          fields: `
+            <label class="field" for="insert-link-url">URL<input id="insert-link-url" name="url" type="text" autocomplete="off"></label>
+            <label class="field" for="insert-link-text">Text<input id="insert-link-text" name="text" type="text" autocomplete="off" value="${escapeAttribute(selectedText)}"></label>
+          `
+        },
+        image: {
+          title: "Insert Image",
+          submit: "Insert",
+          fields: `
+            <label class="field" for="insert-image-source">Source<input id="insert-image-source" name="source" type="text" autocomplete="off"></label>
+            <label class="field" for="insert-image-alt">Alt text<input id="insert-image-alt" name="alt" type="text" autocomplete="off" value="${escapeAttribute(selectedText)}"></label>
+            <label class="field" for="insert-image-title">Title<input id="insert-image-title" name="title" type="text" autocomplete="off"></label>
+          `
+        },
+        table: {
+          title: "Insert Table",
+          submit: "Insert",
+          fields: `
+            <label class="field" for="insert-table-rows">Rows<input id="insert-table-rows" name="rows" type="number" inputmode="numeric" min="1" max="25" step="1" value="3"></label>
+            <label class="field" for="insert-table-columns">Columns<input id="insert-table-columns" name="columns" type="number" inputmode="numeric" min="1" max="12" step="1" value="3"></label>
+          `
+        },
+        footnote: {
+          title: "Insert Footnote",
+          submit: "Insert",
+          fields: `
+            <label class="field" for="insert-footnote-label">Label<input id="insert-footnote-label" name="label" type="text" autocomplete="off" value="${escapeAttribute(nextFootnoteLabel())}"></label>
+            <label class="field" for="insert-footnote-body">Text<textarea id="insert-footnote-body" name="body" spellcheck="true">${escapeHtml(selectedText || "Footnote text")}</textarea></label>
+          `
+        },
+        definition: {
+          title: "Insert Definition List",
+          submit: "Insert",
+          fields: `
+            <label class="field" for="insert-definition-term">Term<input id="insert-definition-term" name="term" type="text" autocomplete="off" value="${escapeAttribute(selectedText || "Term")}"></label>
+            <label class="field" for="insert-definition-body">Definition<textarea id="insert-definition-body" name="definition" spellcheck="true">Definition</textarea></label>
+          `
+        },
+        math: {
+          title: "Insert Math",
+          submit: "Insert",
+          fields: `
+            <label class="field" for="insert-math-expression">Expression<input id="insert-math-expression" name="expression" type="text" autocomplete="off" value="${escapeAttribute(selectedText || "a+b")}"></label>
+            <label class="field" for="insert-math-mode">Mode<select id="insert-math-mode" name="mode"><option value="inline">Inline</option><option value="display">Display</option></select></label>
+          `
+        }
+      };
+      const definition = defaults[kind];
+      if (!definition) {
+        return;
       }
+      insertTitle.textContent = definition.title;
+      insertSubmit.textContent = definition.submit;
+      insertFields.innerHTML = definition.fields;
+      insertBackdrop.hidden = false;
+      requestAnimationFrame(() => {
+        const firstField = insertFields.querySelector("input, textarea, select");
+        if (firstField) {
+          firstField.focus();
+          if (typeof firstField.select === "function") {
+            firstField.select();
+          }
+        }
+      });
+    }
 
+    function closeInsertForm(restoreFocus = true) {
+      insertBackdrop.hidden = true;
+      insertFields.innerHTML = "";
+      insertKind = "";
+      if (restoreFocus && insertReturnFocus) {
+        insertReturnFocus.focus();
+      }
+      insertReturnFocus = null;
+    }
+
+    function submitInsertForm() {
+      if (insertKind === "link") {
+        applyLinkFromForm();
+      } else if (insertKind === "image") {
+        applyImageFromForm();
+      } else if (insertKind === "table") {
+        applyTableFromForm();
+      } else if (insertKind === "footnote") {
+        applyFootnoteFromForm();
+      } else if (insertKind === "definition") {
+        applyDefinitionListFromForm();
+      } else if (insertKind === "math") {
+        applyMathFromForm();
+      }
+    }
+
+    function formValue(name) {
+      const field = insertForm.elements.namedItem(name);
+      return field ? normalizeText(field.value || "").trim() : "";
+    }
+
+    function formNumber(name, fallback, min, max) {
+      const field = insertForm.elements.namedItem(name);
+      const parsed = Number.parseInt(field ? field.value : "", 10);
+      const value = Number.isFinite(parsed) ? parsed : fallback;
+      const bounded = Math.max(min, Math.min(max, value));
+      if (field) {
+        field.value = String(bounded);
+      }
+      return bounded;
+    }
+
+    function applyLinkFromForm() {
+      const url = formValue("url");
+      if (!url) {
+        focusInsertField("url");
+        return;
+      }
+      const label = formValue("text") || selectedRenderedText() || url;
+      restoreRenderedSelection();
       const selection = window.getSelection();
       if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
-        const label = window.prompt("Text") || url;
         document.execCommand("insertHTML", false, `<a href="${escapeAttribute(url)}">${escapeHtml(label)}</a>`);
       } else {
         document.execCommand("createLink", false, url);
-	      }
-	      markRenderedEdited();
-	    }
+      }
+      closeInsertForm(false);
+      markRenderedEdited();
+    }
 
-	    function applyTable() {
-	      restoreRenderedSelection();
-	      const rows = promptPositiveInteger("Rows including header", 3, 1, 25);
-	      if (!rows) {
-	        return;
-	      }
-	      const columns = promptPositiveInteger("Columns", 3, 1, 12);
-	      if (!columns) {
-	        return;
-	      }
+    function applyImageFromForm() {
+      const source = formValue("source");
+      if (!source) {
+        focusInsertField("source");
+        return;
+      }
+      const alt = formValue("alt");
+      const title = formValue("title");
+      insertHtmlAtSelection(`<img src="${escapeAttribute(source)}" alt="${escapeAttribute(alt)}" data-md-src="${escapeAttribute(source)}"${title ? ` title="${escapeAttribute(title)}" data-md-title="${escapeAttribute(title)}"` : ""}>`);
+      closeInsertForm(false);
+    }
 
-	      document.execCommand("insertHTML", false, tableHtml(rows, columns));
-	      markRenderedEdited();
-	    }
+    function applyTableFromForm() {
+      const rows = formNumber("rows", 3, 1, 25);
+      const columns = formNumber("columns", 3, 1, 12);
+      insertHtmlAtSelection(tableHtml(rows, columns));
+      closeInsertForm(false);
+    }
 
-	    function promptPositiveInteger(label, fallback, min, max) {
-	      const answer = window.prompt(label, String(fallback));
-	      if (answer === null) {
-	        return null;
-	      }
-	      const value = Number.parseInt(answer, 10);
-	      if (!Number.isFinite(value) || value < min || value > max) {
-	        return fallback;
-	      }
-	      return value;
-	    }
+    function applyFootnoteFromForm() {
+      const label = sanitizeFootnoteLabel(formValue("label") || nextFootnoteLabel());
+      const body = formValue("body") || "Footnote text";
+      insertHtmlAtSelection(`<sup class="footnote-reference"><a href="#${escapeAttribute(label)}">${escapeHtml(label)}</a></sup>`);
+      rendered.insertAdjacentHTML("beforeend", `<div class="footnote-definition" id="${escapeAttribute(label)}"><sup class="footnote-definition-label">${escapeHtml(label)}</sup><p>${escapeHtml(body)}</p></div>`);
+      closeInsertForm(false);
+      markRenderedEdited();
+    }
+
+    function applyDefinitionListFromForm() {
+      const term = formValue("term") || "Term";
+      const definition = formValue("definition") || "Definition";
+      insertHtmlAtSelection(`<dl><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(definition)}</dd></dl>`);
+      closeInsertForm(false);
+    }
+
+    function applyMathFromForm() {
+      const expression = formValue("expression") || "a+b";
+      const mode = formValue("mode") === "display" ? "display" : "inline";
+      if (mode === "display") {
+        insertHtmlAtSelection(`<div><span class="math math-display">${escapeHtml(expression)}</span></div>`);
+      } else {
+        insertHtmlAtSelection(`<span class="math math-inline">${escapeHtml(expression)}</span>`);
+      }
+      closeInsertForm(false);
+    }
+
+    function applyTaskList() {
+      const text = selectedRenderedText() || "Task";
+      insertHtmlAtSelection(`<ul><li><input type="checkbox" disabled> ${escapeHtml(text)}</li></ul>`);
+    }
+
+    function insertHtmlAtSelection(html) {
+      restoreRenderedSelection();
+      document.execCommand("insertHTML", false, html);
+      markRenderedEdited();
+    }
+
+    function focusInsertField(name) {
+      const field = insertForm.elements.namedItem(name);
+      if (field) {
+        field.focus();
+      }
+    }
+
+    function selectedRenderedText() {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0 || !selection.anchorNode || !rendered.contains(selection.anchorNode)) {
+        return "";
+      }
+      return normalizeText(selection.toString()).trim();
+    }
+
+    function nextFootnoteLabel() {
+      let index = 1;
+      while (document.getElementById(`note-${index}`) || rendered.querySelector(`a[href="#note-${index}"]`)) {
+        index += 1;
+      }
+      return `note-${index}`;
+    }
+
+    function sanitizeFootnoteLabel(label) {
+      const cleaned = normalizeText(label)
+        .replace(/^\[\^/, "")
+        .replace(/\]$/, "")
+        .trim()
+        .replace(/[^A-Za-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+      return cleaned || nextFootnoteLabel();
+    }
 
 	    function tableHtml(rows, columns) {
 	      const headCells = Array.from({ length: columns }, (_, index) => `<th>Header ${index + 1}</th>`).join("");
@@ -3474,6 +3790,17 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
         closeSettings();
       }
     });
+    insertClose.addEventListener("click", () => closeInsertForm());
+    insertCancel.addEventListener("click", () => closeInsertForm());
+    insertBackdrop.addEventListener("click", (event) => {
+      if (event.target === insertBackdrop) {
+        closeInsertForm();
+      }
+    });
+    insertForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitInsertForm();
+    });
 
     themeSelect.addEventListener("change", () => {
       applyTheme(themeSelect.value);
@@ -3504,10 +3831,25 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     inlineCodeButton.addEventListener("click", applyInlineCode);
 
 	    linkButton.addEventListener("mousedown", (event) => event.preventDefault());
-	    linkButton.addEventListener("click", applyLink);
+	    linkButton.addEventListener("click", () => openInsertForm("link", linkButton));
+
+	    imageButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    imageButton.addEventListener("click", () => openInsertForm("image", imageButton));
+
+	    mathButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    mathButton.addEventListener("click", () => openInsertForm("math", mathButton));
+
+	    taskListButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    taskListButton.addEventListener("click", applyTaskList);
 
 	    tableButton.addEventListener("mousedown", (event) => event.preventDefault());
-	    tableButton.addEventListener("click", applyTable);
+	    tableButton.addEventListener("click", () => openInsertForm("table", tableButton));
+
+	    definitionListButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    definitionListButton.addEventListener("click", () => openInsertForm("definition", definitionListButton));
+
+	    footnoteButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    footnoteButton.addEventListener("click", () => openInsertForm("footnote", footnoteButton));
 
 	    editor.addEventListener("input", () => {
       setDirty(true);
@@ -3544,6 +3886,10 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       if (event.key === "Escape" && !settingsBackdrop.hidden) {
         event.preventDefault();
         closeSettings();
+      }
+      if (event.key === "Escape" && !insertBackdrop.hidden) {
+        event.preventDefault();
+        closeInsertForm();
       }
       if (event.key === "Escape" && !linkMenu.hidden) {
         event.preventDefault();
@@ -3672,7 +4018,17 @@ mod tests {
         assert!(html.contains("Save (Ctrl+S)"));
         assert!(html.contains("settings-button"));
         assert!(html.contains("format-toolbar"));
+        assert!(html.contains(r#"title="Strikethrough""#));
+        assert!(html.contains("data-command=\"subscript\""));
+        assert!(html.contains("data-command=\"superscript\""));
+        assert!(html.contains("math-button"));
+        assert!(html.contains("image-button"));
+        assert!(html.contains("task-list-button"));
         assert!(html.contains("table-button"));
+        assert!(html.contains("definition-list-button"));
+        assert!(html.contains("footnote-button"));
+        assert!(html.contains("insert-backdrop"));
+        assert!(html.contains("insert-form"));
         assert!(html.contains(r#"grid-template-rows: 34px minmax(0, 1fr)"#));
         assert!(html.contains("contenteditable=\"true\""));
         assert!(html.contains(r#""themeId":"clean""#));
@@ -3687,7 +4043,9 @@ mod tests {
         assert!(html.contains("allowed-launch-extensions"));
         assert!(html.contains("allowedLaunchExtensions"));
         assert!(html.contains("allowed-extensions-help"));
-        assert!(html.contains("Allowed by default: links with no extension"));
+        assert!(html.contains("Allowed by default: no extension, .bmp"));
+        assert!(html.contains(".md, .markdown"));
+        assert!(!html.contains("not executable or script-like"));
         assert!(html.contains("allow-remote-images"));
         assert!(html.contains("allowRemoteImages"));
         assert!(html.contains("link-click-behavior"));
@@ -3700,8 +4058,12 @@ mod tests {
         assert!(html.contains("openLink"));
         assert!(html.contains("__mdReaderOpenLinkFailed"));
         assert!(html.contains("tableHtml"));
+        assert!(html.contains("openInsertForm"));
+        assert!(html.contains("applyImageFromForm"));
+        assert!(html.contains("applyTaskList"));
         assert!(html.contains("taskListPrefix"));
         assert!(html.contains("mathMarkdown"));
+        assert!(!html.contains("window.prompt"));
         assert!(!html.contains("type=\"file\""));
         assert!(!html.contains("localStorage"));
     }
@@ -4000,6 +4362,7 @@ mod tests {
         assert!(
             resolve_link_target(Path::new("C:/Docs/source.md"), "file:///C:/Docs/run.ps1").is_err()
         );
+        assert!(resolve_link_target(Path::new("C:/Docs/source.md"), "notes/custom.safe").is_err());
     }
 
     #[test]
