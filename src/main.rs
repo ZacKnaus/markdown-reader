@@ -104,7 +104,8 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
             Err(error) => eprintln!("invalid IPC message: {error}"),
         };
 
-    let initial_html = build_app_html(&markdown, &settings)?;
+    let mut current_settings = normalize_settings(&settings);
+    let initial_html = build_app_html(&markdown, &current_settings)?;
     let builder = WebViewBuilder::new()
         .with_html(initial_html)
         .with_ipc_handler(handler)
@@ -162,7 +163,11 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
             }
             TaoEvent::UserEvent(AppEvent::SaveSettings { settings }) => {
                 if let Some(webview) = webview.as_ref() {
+                    let settings = normalize_settings(&settings);
                     let result = save_app_settings(&settings_path, &settings);
+                    if result.is_ok() {
+                        current_settings = settings;
+                    }
                     notify_settings_finished(webview, result);
                 }
             }
@@ -176,7 +181,7 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
                 }
             }
             TaoEvent::UserEvent(AppEvent::OpenLink { href }) => {
-                if let Err(error) = open_link_target(&input_path, &href) {
+                if let Err(error) = open_link_target(&input_path, &href, &current_settings) {
                     if let Some(webview) = webview.as_ref() {
                         notify_open_link_failed(webview, &error.to_string());
                     } else {
@@ -239,6 +244,8 @@ struct ScrollMarker {
 struct AppSettings {
     theme_id: String,
     custom_css: String,
+    #[serde(default)]
+    allowed_launch_extensions: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -246,6 +253,7 @@ impl Default for AppSettings {
         Self {
             theme_id: "clean".to_string(),
             custom_css: String::new(),
+            allowed_launch_extensions: Vec::new(),
         }
     }
 }
@@ -449,6 +457,9 @@ fn normalize_settings(settings: &AppSettings) -> AppSettings {
     AppSettings {
         theme_id,
         custom_css,
+        allowed_launch_extensions: normalize_allowed_launch_extensions(
+            &settings.allowed_launch_extensions,
+        ),
     }
 }
 
@@ -468,21 +479,72 @@ fn sanitize_settings_css(css: &str) -> String {
         .join("\n")
 }
 
+fn normalize_allowed_launch_extensions(extensions: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+
+    for extension in extensions {
+        for token in extension
+            .split(|character: char| character.is_whitespace() || matches!(character, ',' | ';'))
+        {
+            let Some(extension) = normalize_launch_extension_token(token) else {
+                continue;
+            };
+            if !normalized.contains(&extension) {
+                normalized.push(extension);
+            }
+            if normalized.len() >= 64 {
+                return normalized;
+            }
+        }
+    }
+
+    normalized
+}
+
+fn normalize_launch_extension_token(token: &str) -> Option<String> {
+    let extension = token
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if extension.is_empty()
+        || !extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        None
+    } else {
+        Some(extension)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LinkTarget {
     Url(String),
     Document(PathBuf),
 }
 
-fn open_link_target(document_path: &Path, href: &str) -> Result<()> {
-    let target = resolve_link_target(document_path, href)?;
+fn open_link_target(document_path: &Path, href: &str, settings: &AppSettings) -> Result<()> {
+    let target = resolve_link_target_with_settings(document_path, href, settings)?;
     match target {
         LinkTarget::Url(url) => open_with_default_handler(OsStr::new(&url)),
         LinkTarget::Document(path) => open_with_default_handler(path.as_os_str()),
     }
 }
 
+#[cfg(test)]
 fn resolve_link_target(document_path: &Path, href: &str) -> Result<LinkTarget> {
+    resolve_link_target_with_settings(document_path, href, &AppSettings::default())
+}
+
+fn resolve_link_target_with_settings(
+    document_path: &Path,
+    href: &str,
+    settings: &AppSettings,
+) -> Result<LinkTarget> {
+    let settings = normalize_settings(settings);
     let trimmed = href.trim();
     if trimmed.is_empty() {
         bail!("link target is empty");
@@ -494,7 +556,7 @@ fn resolve_link_target(document_path: &Path, href: &str) -> Result<LinkTarget> {
     if let Some(scheme) = href_scheme(trimmed) {
         return match scheme.to_ascii_lowercase().as_str() {
             "file" => {
-                ensure_file_url_is_launchable(trimmed)?;
+                ensure_file_url_is_launchable(trimmed, &settings)?;
                 Ok(LinkTarget::Url(trimmed.to_string()))
             }
             "http" | "https" | "mailto" => Ok(LinkTarget::Url(trimmed.to_string())),
@@ -509,7 +571,7 @@ fn resolve_link_target(document_path: &Path, href: &str) -> Result<LinkTarget> {
     }
 
     let linked_path = PathBuf::from(decoded);
-    ensure_document_path_is_launchable(&linked_path)?;
+    ensure_document_path_is_launchable(&linked_path, &settings)?;
     if linked_path.is_absolute() {
         Ok(LinkTarget::Document(linked_path))
     } else {
@@ -518,13 +580,13 @@ fn resolve_link_target(document_path: &Path, href: &str) -> Result<LinkTarget> {
     }
 }
 
-fn ensure_file_url_is_launchable(href: &str) -> Result<()> {
+fn ensure_file_url_is_launchable(href: &str, settings: &AppSettings) -> Result<()> {
     let path_part = strip_link_fragment_and_query(href);
     let decoded = percent_decode_path(path_part)?;
-    ensure_document_path_is_launchable(Path::new(&decoded))
+    ensure_document_path_is_launchable(Path::new(&decoded), settings)
 }
 
-fn ensure_document_path_is_launchable(path: &Path) -> Result<()> {
+fn ensure_document_path_is_launchable(path: &Path, settings: &AppSettings) -> Result<()> {
     let Some(extension) = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -532,6 +594,14 @@ fn ensure_document_path_is_launchable(path: &Path) -> Result<()> {
     else {
         return Ok(());
     };
+
+    if settings
+        .allowed_launch_extensions
+        .iter()
+        .any(|allowed| allowed == &extension)
+    {
+        return Ok(());
+    }
 
     if matches!(
         extension.as_str(),
@@ -1324,6 +1394,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     }
 
     .settings-body select,
+    .settings-body textarea,
     .settings-button {
       width: 100%;
       min-height: 32px;
@@ -1333,6 +1404,13 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       border-radius: 4px;
       padding: 4px 8px;
       font: 14px/1.3 "Segoe UI", system-ui, sans-serif;
+    }
+
+    .settings-body textarea {
+      min-height: 68px;
+      resize: vertical;
+      font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+      line-height: 1.45;
     }
 
     .settings-button {
@@ -1435,6 +1513,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
           Custom CSS
           <button id="custom-css-button" class="settings-button" type="button">Choose CSS...</button>
         </label>
+        <label class="field" for="allowed-launch-extensions">
+          Allowed Link Extensions
+          <textarea id="allowed-launch-extensions" spellcheck="false" placeholder=".ps1, .exe"></textarea>
+        </label>
       </div>
     </section>
   </div>
@@ -1452,6 +1534,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const settingsClose = document.getElementById("settings-close");
     const themeSelect = document.getElementById("theme-select");
     const customCssButton = document.getElementById("custom-css-button");
+    const allowedLaunchExtensionsInput = document.getElementById("allowed-launch-extensions");
     const themeStyle = document.getElementById("theme-style");
     const customThemeStyle = document.getElementById("custom-theme-style");
     const blockFormat = document.getElementById("block-format");
@@ -1460,10 +1543,12 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     let dirty = false;
     let renderedDirty = false;
     let customCss = sanitizeCustomCss(initialSettings.customCss || "");
+    let allowedLaunchExtensions = sanitizeAllowedLaunchExtensions(initialSettings.allowedLaunchExtensions || []);
     let savedRenderedRange = null;
 
     editor.value = initialMarkdown;
     rendered.innerHTML = initialRendered;
+    allowedLaunchExtensionsInput.value = formatAllowedLaunchExtensions(allowedLaunchExtensions);
 
     function postMessage(payload) {
       window.ipc.postMessage(JSON.stringify(payload));
@@ -1870,16 +1955,17 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         customThemeStyle.textContent = "";
       }
       if (persist) {
-        saveThemeSettings(themeId);
+        saveSettings(themeId);
       }
     }
 
-    function saveThemeSettings(themeId) {
+    function saveSettings(themeId) {
       postMessage({
         kind: "saveSettings",
         settings: {
           themeId,
-          customCss
+          customCss,
+          allowedLaunchExtensions
         }
       });
     }
@@ -1894,6 +1980,34 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         .split(/\r\n|\r|\n/)
         .filter((line) => !/@import|https?:\/\/|javascript:|expression\s*\(|behavior:|-moz-binding/i.test(line))
         .join("\n");
+    }
+
+    function sanitizeAllowedLaunchExtensions(value) {
+      const source = Array.isArray(value) ? value.join(" ") : normalizeText(value || "");
+      const result = [];
+      for (const token of source.split(/[\s,;]+/)) {
+        const extension = token.trim().replace(/^\.+/, "").slice(0, 32).toLowerCase();
+        if (!extension || !/^[a-z0-9_-]+$/.test(extension)) {
+          continue;
+        }
+        if (!result.includes(extension)) {
+          result.push(extension);
+        }
+        if (result.length >= 64) {
+          break;
+        }
+      }
+      return result;
+    }
+
+    function formatAllowedLaunchExtensions(extensions) {
+      return extensions.map((extension) => `.${extension}`).join(", ");
+    }
+
+    function saveAllowedLaunchExtensions() {
+      allowedLaunchExtensions = sanitizeAllowedLaunchExtensions(allowedLaunchExtensionsInput.value);
+      allowedLaunchExtensionsInput.value = formatAllowedLaunchExtensions(allowedLaunchExtensions);
+      saveSettings(themeSelect.value);
     }
 
     function openSettings() {
@@ -2057,6 +2171,7 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     });
 
     customCssButton.addEventListener("click", pickCustomCss);
+    allowedLaunchExtensionsInput.addEventListener("change", saveAllowedLaunchExtensions);
 
     document.querySelectorAll("[data-command]").forEach((button) => {
       button.addEventListener("mousedown", (event) => event.preventDefault());
@@ -2183,6 +2298,8 @@ mod tests {
         assert!(html.contains("custom-css-button"));
         assert!(html.contains("pickCustomCss"));
         assert!(html.contains("__mdReaderCustomCssPicked"));
+        assert!(html.contains("allowed-launch-extensions"));
+        assert!(html.contains("allowedLaunchExtensions"));
         assert!(html.contains("openLink"));
         assert!(html.contains("__mdReaderOpenLinkFailed"));
         assert!(!html.contains("type=\"file\""));
@@ -2242,10 +2359,12 @@ mod tests {
         let settings = normalize_settings(&AppSettings {
             theme_id: "missing".to_string(),
             custom_css: String::new(),
+            allowed_launch_extensions: Vec::new(),
         });
 
         assert_eq!(settings.theme_id, "clean");
         assert!(settings.custom_css.is_empty());
+        assert!(settings.allowed_launch_extensions.is_empty());
     }
 
     #[test]
@@ -2253,10 +2372,12 @@ mod tests {
         let without_css = normalize_settings(&AppSettings {
             theme_id: "custom".to_string(),
             custom_css: String::new(),
+            allowed_launch_extensions: Vec::new(),
         });
         let with_css = normalize_settings(&AppSettings {
             theme_id: "custom".to_string(),
             custom_css: "body { color: #123; }".to_string(),
+            allowed_launch_extensions: Vec::new(),
         });
 
         assert_eq!(without_css.theme_id, "clean");
@@ -2270,10 +2391,30 @@ mod tests {
             theme_id: "custom".to_string(),
             custom_css: "@import url('https://example.com/x.css');\nbody { color: #123; }\na { background: url(http://example.com/x.png); }\ndiv { width: expression(alert(1)); }"
                 .to_string(),
+            allowed_launch_extensions: Vec::new(),
         });
 
         assert_eq!(settings.theme_id, "custom");
         assert_eq!(settings.custom_css, "body { color: #123; }");
+    }
+
+    #[test]
+    fn settings_normalize_allowed_launch_extensions() {
+        let settings = normalize_settings(&AppSettings {
+            theme_id: "clean".to_string(),
+            custom_css: String::new(),
+            allowed_launch_extensions: vec![
+                ".EXE, ps1".to_string(),
+                "bad!*".to_string(),
+                "cmd".to_string(),
+                ".cmd".to_string(),
+            ],
+        });
+
+        assert_eq!(
+            settings.allowed_launch_extensions,
+            vec!["exe".to_string(), "ps1".to_string(), "cmd".to_string()]
+        );
     }
 
     #[test]
@@ -2323,6 +2464,34 @@ mod tests {
         assert!(resolve_link_target(Path::new("C:/Docs/source.md"), "tools/install.exe").is_err());
         assert!(
             resolve_link_target(Path::new("C:/Docs/source.md"), "file:///C:/Docs/run.ps1").is_err()
+        );
+    }
+
+    #[test]
+    fn link_target_allows_configured_local_extensions() {
+        let settings = AppSettings {
+            theme_id: "clean".to_string(),
+            custom_css: String::new(),
+            allowed_launch_extensions: vec!["exe".to_string(), "ps1".to_string()],
+        };
+
+        assert_eq!(
+            resolve_link_target_with_settings(
+                Path::new("C:/Docs/source.md"),
+                "tools/install.exe",
+                &settings
+            )
+            .expect("configured extension should be launchable"),
+            LinkTarget::Document(PathBuf::from("C:/Docs/tools/install.exe"))
+        );
+        assert_eq!(
+            resolve_link_target_with_settings(
+                Path::new("C:/Docs/source.md"),
+                "file:///C:/Docs/run.ps1",
+                &settings
+            )
+            .expect("configured file URL extension should be launchable"),
+            LinkTarget::Url("file:///C:/Docs/run.ps1".to_string())
         );
     }
 
