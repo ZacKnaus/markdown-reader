@@ -19,6 +19,7 @@ For a no-registry `Open with` entry that shows a friendly filename, build the Wi
 ```
 
 Use `target\release\Markdown Reader.exe` for the Windows picker. The plain Cargo binary remains `target\release\markdown-reader.exe`.
+The helper initializes Visual Studio Build Tools when they are installed but not already loaded in the current shell.
 
 ## Editing And Saving
 
@@ -31,6 +32,8 @@ Use `target\release\Markdown Reader.exe` for the Windows picker. The plain Cargo
 - Closing the window does not autosave. Unsaved changes prompt before close.
 
 Formatted-view edits are converted back to conservative Markdown when saving or switching to plaintext. That path preserves common structures such as headings, paragraphs, lists, blockquotes, code blocks, links, images, and tables, but it may normalize some original spacing.
+
+Click links in formatted view to open safe targets with the Windows default handler. Relative document links are resolved from the folder containing the opened Markdown file, internal `#heading` links scroll inside the reader, and local executable/script-like targets are blocked.
 
 ## Table Of Contents
 

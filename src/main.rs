@@ -2,7 +2,9 @@
 
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -96,6 +98,9 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
             Ok(IpcMessage::PickCustomCss) => {
                 let _ = proxy.send_event(AppEvent::PickCustomCss);
             }
+            Ok(IpcMessage::OpenLink { href }) => {
+                let _ = proxy.send_event(AppEvent::OpenLink { href });
+            }
             Err(error) => eprintln!("invalid IPC message: {error}"),
         };
 
@@ -170,6 +175,15 @@ fn launch_window(input_path: PathBuf, markdown: String, settings: AppSettings) -
                     }
                 }
             }
+            TaoEvent::UserEvent(AppEvent::OpenLink { href }) => {
+                if let Err(error) = open_link_target(&input_path, &href) {
+                    if let Some(webview) = webview.as_ref() {
+                        notify_open_link_failed(webview, &error.to_string());
+                    } else {
+                        eprintln!("failed to open link: {error:#}");
+                    }
+                }
+            }
             _ => {}
         }
     });
@@ -189,6 +203,9 @@ enum AppEvent {
         settings: AppSettings,
     },
     PickCustomCss,
+    OpenLink {
+        href: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +223,9 @@ enum IpcMessage {
         settings: AppSettings,
     },
     PickCustomCss,
+    OpenLink {
+        href: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -326,6 +346,12 @@ fn notify_custom_css_picked(webview: &WebView, result: Result<String>) {
     ));
 }
 
+fn notify_open_link_failed(webview: &WebView, message: &str) {
+    let message_json =
+        serde_json::to_string(message).unwrap_or_else(|_| "\"failed to open link\"".into());
+    let _ = webview.evaluate_script(&format!("window.__mdReaderOpenLinkFailed({message_json});"));
+}
+
 fn app_settings_dir() -> PathBuf {
     let base = env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -440,6 +466,222 @@ fn sanitize_settings_css(css: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinkTarget {
+    Url(String),
+    Document(PathBuf),
+}
+
+fn open_link_target(document_path: &Path, href: &str) -> Result<()> {
+    let target = resolve_link_target(document_path, href)?;
+    match target {
+        LinkTarget::Url(url) => open_with_default_handler(OsStr::new(&url)),
+        LinkTarget::Document(path) => open_with_default_handler(path.as_os_str()),
+    }
+}
+
+fn resolve_link_target(document_path: &Path, href: &str) -> Result<LinkTarget> {
+    let trimmed = href.trim();
+    if trimmed.is_empty() {
+        bail!("link target is empty");
+    }
+    if trimmed.starts_with('#') {
+        bail!("internal document links are handled inside the reader");
+    }
+
+    if let Some(scheme) = href_scheme(trimmed) {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "file" => {
+                ensure_file_url_is_launchable(trimmed)?;
+                Ok(LinkTarget::Url(trimmed.to_string()))
+            }
+            "http" | "https" | "mailto" => Ok(LinkTarget::Url(trimmed.to_string())),
+            _ => bail!("blocked unsupported link scheme: {scheme}"),
+        };
+    }
+
+    let path_part = strip_link_fragment_and_query(trimmed);
+    let decoded = percent_decode_path(path_part)?;
+    if decoded.trim().is_empty() {
+        bail!("link target does not include a document path");
+    }
+
+    let linked_path = PathBuf::from(decoded);
+    ensure_document_path_is_launchable(&linked_path)?;
+    if linked_path.is_absolute() {
+        Ok(LinkTarget::Document(linked_path))
+    } else {
+        let base_dir = document_path.parent().unwrap_or_else(|| Path::new("."));
+        Ok(LinkTarget::Document(base_dir.join(linked_path)))
+    }
+}
+
+fn ensure_file_url_is_launchable(href: &str) -> Result<()> {
+    let path_part = strip_link_fragment_and_query(href);
+    let decoded = percent_decode_path(path_part)?;
+    ensure_document_path_is_launchable(Path::new(&decoded))
+}
+
+fn ensure_document_path_is_launchable(path: &Path) -> Result<()> {
+    let Some(extension) = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+    else {
+        return Ok(());
+    };
+
+    if matches!(
+        extension.as_str(),
+        "bat"
+            | "cmd"
+            | "com"
+            | "cpl"
+            | "exe"
+            | "hta"
+            | "jar"
+            | "jse"
+            | "lnk"
+            | "msi"
+            | "msp"
+            | "ps1"
+            | "psm1"
+            | "reg"
+            | "scr"
+            | "url"
+            | "vbe"
+            | "vbs"
+            | "wsf"
+            | "wsh"
+    ) {
+        bail!("blocked potentially executable link target: .{extension}");
+    }
+
+    Ok(())
+}
+
+fn href_scheme(href: &str) -> Option<&str> {
+    let colon_index = href.find(':')?;
+    let candidate = &href[..colon_index];
+    if candidate.len() == 1
+        && href
+            .as_bytes()
+            .get(colon_index + 1)
+            .is_some_and(|byte| matches!(*byte, b'\\' | b'/'))
+    {
+        return None;
+    }
+
+    let mut chars = candidate.chars();
+    if !chars.next()?.is_ascii_alphabetic() {
+        return None;
+    }
+    if chars
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.'))
+    {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn strip_link_fragment_and_query(href: &str) -> &str {
+    href.find(['#', '?'])
+        .map(|index| &href[..index])
+        .unwrap_or(href)
+}
+
+fn percent_decode_path(path: &str) -> Result<String> {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8(decoded).context("link path is not valid UTF-8 after percent decoding")
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn open_with_default_handler(target: &OsStr) -> Result<()> {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> *mut c_void;
+    }
+
+    fn wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+
+    let operation = wide(OsStr::new("open"));
+    let file = wide(target);
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1,
+        )
+    } as isize;
+
+    if result <= 32 {
+        bail!("Windows could not open link target (ShellExecuteW error {result})");
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_with_default_handler(target: &OsStr) -> Result<()> {
+    use std::process::Command;
+
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = Command::new(opener)
+        .arg(target)
+        .status()
+        .with_context(|| format!("failed to launch {opener}"))?;
+    if !status.success() {
+        bail!("{opener} failed with status {status}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1782,6 +2024,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       applyTheme("custom");
     };
 
+    window.__mdReaderOpenLinkFailed = (message) => {
+      alert(message || "Link could not be opened.");
+    };
+
     window.__mdReaderRequestClose = () => {
       if (!dirty || window.confirm("Close without saving changes?")) {
         postMessage({ kind: "close" });
@@ -1875,6 +2121,8 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
           if (target) {
             rendered.scrollTop = Math.max(0, target.offsetTop - 28);
           }
+        } else if (href.trim()) {
+          postMessage({ kind: "openLink", href });
         }
       }
     });
@@ -1935,6 +2183,8 @@ mod tests {
         assert!(html.contains("custom-css-button"));
         assert!(html.contains("pickCustomCss"));
         assert!(html.contains("__mdReaderCustomCssPicked"));
+        assert!(html.contains("openLink"));
+        assert!(html.contains("__mdReaderOpenLinkFailed"));
         assert!(!html.contains("type=\"file\""));
         assert!(!html.contains("localStorage"));
     }
@@ -2024,6 +2274,61 @@ mod tests {
 
         assert_eq!(settings.theme_id, "custom");
         assert_eq!(settings.custom_css, "body { color: #123; }");
+    }
+
+    #[test]
+    fn link_target_resolves_relative_documents_against_markdown_parent() {
+        let target = resolve_link_target(
+            Path::new("C:/Docs/source.md"),
+            "references/Other%20Document.md#section",
+        )
+        .expect("relative document link should resolve");
+
+        assert_eq!(
+            target,
+            LinkTarget::Document(PathBuf::from("C:/Docs/references/Other Document.md"))
+        );
+    }
+
+    #[test]
+    fn link_target_allows_common_external_schemes() {
+        assert_eq!(
+            resolve_link_target(Path::new("C:/Docs/source.md"), "https://example.com")
+                .expect("https links should be launchable"),
+            LinkTarget::Url("https://example.com".to_string())
+        );
+        assert_eq!(
+            resolve_link_target(Path::new("C:/Docs/source.md"), "mailto:hello@example.com")
+                .expect("mailto links should be launchable"),
+            LinkTarget::Url("mailto:hello@example.com".to_string())
+        );
+        assert_eq!(
+            resolve_link_target(Path::new("C:/Docs/source.md"), "file:///C:/Docs/other.md")
+                .expect("file links should be launchable"),
+            LinkTarget::Url("file:///C:/Docs/other.md".to_string())
+        );
+    }
+
+    #[test]
+    fn link_target_blocks_unsafe_schemes_and_skips_internal_anchors() {
+        assert!(
+            resolve_link_target(Path::new("C:/Docs/source.md"), "javascript:alert(1)").is_err()
+        );
+        assert!(resolve_link_target(Path::new("C:/Docs/source.md"), "data:text/html,hi").is_err());
+        assert!(resolve_link_target(Path::new("C:/Docs/source.md"), "#local-heading").is_err());
+    }
+
+    #[test]
+    fn link_target_blocks_potentially_executable_local_files() {
+        assert!(resolve_link_target(Path::new("C:/Docs/source.md"), "tools/install.exe").is_err());
+        assert!(
+            resolve_link_target(Path::new("C:/Docs/source.md"), "file:///C:/Docs/run.ps1").is_err()
+        );
+    }
+
+    #[test]
+    fn windows_drive_paths_are_treated_as_documents_not_schemes() {
+        assert_eq!(href_scheme("C:\\Docs\\Other.md"), None);
     }
 
     #[test]
