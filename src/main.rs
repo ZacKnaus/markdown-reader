@@ -5,7 +5,10 @@ use std::{
     env,
     ffi::OsStr,
     fs,
+    io::Read,
+    net::{IpAddr, ToSocketAddrs},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -15,9 +18,10 @@ use serde::{Deserialize, Serialize};
 use tao::{
     dpi::LogicalSize,
     event::{Event as TaoEvent, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     window::{Icon, Window, WindowBuilder},
 };
+use url::Url;
 use wry::{http::Request, NewWindowResponse, WebView, WebViewBuilder};
 
 const WINDOW_WIDTH: f64 = 1200.0;
@@ -27,6 +31,15 @@ const APP_ICON_HEIGHT: u32 = 32;
 const APP_ICON_RGBA: &[u8] = include_bytes!("../assets/app-icon-32.rgba");
 const LINK_BEHAVIOR_NEW_WINDOW: &str = "newWindow";
 const LINK_BEHAVIOR_NAVIGATE: &str = "navigate";
+const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 3;
+const REMOTE_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const REMOTE_IMAGE_MAX_PER_WINDOW: usize = 64;
+const DEFAULT_IMAGE_EXTENSIONS: &[&str] = &["bmp", "gif", "jpeg", "jpg", "png", "webp"];
+const TRANSPARENT_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+];
 
 fn main() {
     if let Err(error) = run() {
@@ -75,6 +88,7 @@ fn window_title_for_path(input_path: &Path) -> String {
 fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSettings) -> Result<()> {
     let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let image_proxy = event_loop.create_proxy();
     let settings_path = app_settings_path();
     let themes_path = app_themes_path();
     let window_title = window_title_for_path(&input_path);
@@ -114,7 +128,8 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
         };
 
     let mut current_settings = normalize_settings(&settings);
-    let initial_html = build_app_html(&markdown, &current_settings)?;
+    let mut image_cache = ImageCache::new(image_proxy).context("failed to create image cache")?;
+    let initial_html = build_app_html(&markdown, &input_path, &current_settings, &mut image_cache)?;
     let builder = WebViewBuilder::new()
         .with_html(initial_html)
         .with_ipc_handler(handler)
@@ -142,17 +157,24 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                         )
                         .is_err()
                     {
+                        image_cache.cleanup();
                         let _ = webview.take();
                         *control_flow = ControlFlow::Exit;
                     }
                 } else {
+                    image_cache.cleanup();
                     *control_flow = ControlFlow::Exit;
                 }
             }
             TaoEvent::UserEvent(AppEvent::Render { markdown, marker }) => {
                 if let Some(webview) = webview.as_ref() {
                     let expanded_markdown = expand_toc_markers(&markdown);
-                    let html = render_markdown_safely(&expanded_markdown);
+                    let html = render_markdown_for_document(
+                        &expanded_markdown,
+                        &input_path,
+                        &current_settings,
+                        &mut image_cache,
+                    );
                     if let Err(error) =
                         apply_rendered_html(webview, &html, &expanded_markdown, &marker)
                     {
@@ -168,6 +190,7 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                 }
             }
             TaoEvent::UserEvent(AppEvent::Close) => {
+                image_cache.cleanup();
                 let _ = webview.take();
                 *control_flow = ControlFlow::Exit;
             }
@@ -200,6 +223,7 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                         &window,
                         &href,
                         &current_settings,
+                        &mut image_cache,
                     )
                 } else {
                     open_link_target(&input_path, &href, &current_settings)
@@ -235,6 +259,8 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                     previous_path.clone(),
                     webview.as_ref(),
                     &window,
+                    &current_settings,
+                    &mut image_cache,
                 ) {
                     Ok(()) => {
                         if let Some(webview) = webview.as_ref() {
@@ -249,6 +275,14 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                         } else {
                             eprintln!("failed to go back: {error:#}");
                         }
+                    }
+                }
+            }
+            TaoEvent::UserEvent(AppEvent::RemoteImageReady { source, file_url }) => {
+                image_cache.mark_remote_file_url(&source, file_url.clone());
+                if current_settings.allow_remote_images {
+                    if let Some(webview) = webview.as_ref() {
+                        notify_remote_image_ready(webview, &source, file_url.as_deref());
                     }
                 }
             }
@@ -276,6 +310,10 @@ enum AppEvent {
         behavior: String,
     },
     GoBack,
+    RemoteImageReady {
+        source: String,
+        file_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,6 +353,8 @@ struct AppSettings {
     allowed_launch_extensions: Vec<String>,
     #[serde(default)]
     link_click_behavior: String,
+    #[serde(default)]
+    allow_remote_images: bool,
 }
 
 impl Default for AppSettings {
@@ -324,6 +364,266 @@ impl Default for AppSettings {
             custom_css: String::new(),
             allowed_launch_extensions: Vec::new(),
             link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
+            allow_remote_images: false,
+        }
+    }
+}
+
+struct ImageCache {
+    root: PathBuf,
+    remote_urls: HashMap<String, RemoteImageState>,
+    next_file_index: usize,
+    placeholder_file_url: Option<String>,
+    proxy: EventLoopProxy<AppEvent>,
+}
+
+impl ImageCache {
+    fn new(proxy: EventLoopProxy<AppEvent>) -> Result<Self> {
+        let root = create_window_image_cache_dir()?;
+
+        Ok(Self {
+            root,
+            remote_urls: HashMap::new(),
+            next_file_index: 0,
+            placeholder_file_url: None,
+            proxy,
+        })
+    }
+
+    fn remote_file_url(&mut self, image_url: &str) -> Result<String> {
+        if image_url.len() > 4096 {
+            bail!("remote image URL is too long");
+        }
+        let image_url = validate_remote_image_url(image_url)?.to_string();
+        match self.remote_urls.get(&image_url) {
+            Some(RemoteImageState::Ready(cached_url)) => return Ok(cached_url.clone()),
+            Some(RemoteImageState::Pending | RemoteImageState::Failed) => {
+                return self.placeholder_file_url();
+            }
+            None => {}
+        }
+        if self.remote_urls.len() >= REMOTE_IMAGE_MAX_PER_WINDOW {
+            bail!("too many remote images in this window");
+        }
+
+        let file_index = self.next_file_index;
+        self.next_file_index += 1;
+        self.remote_urls
+            .insert(image_url.clone(), RemoteImageState::Pending);
+        let root = self.root.clone();
+        let proxy = self.proxy.clone();
+        let source = image_url.clone();
+        std::thread::spawn(move || {
+            let file_url = fetch_remote_image_to_cache(&source, &root, file_index).ok();
+            let _ = proxy.send_event(AppEvent::RemoteImageReady { source, file_url });
+        });
+
+        self.placeholder_file_url()
+    }
+
+    fn mark_remote_file_url(&mut self, source: &str, file_url: Option<String>) {
+        let state = match file_url {
+            Some(file_url) => RemoteImageState::Ready(file_url),
+            None => RemoteImageState::Failed,
+        };
+        self.remote_urls.insert(source.to_string(), state);
+    }
+
+    fn placeholder_file_url(&mut self) -> Result<String> {
+        if let Some(file_url) = &self.placeholder_file_url {
+            return Ok(file_url.clone());
+        }
+
+        let path = self.root.join("blocked-image.gif");
+        fs::write(&path, TRANSPARENT_GIF)
+            .with_context(|| format!("failed to write placeholder image {}", path.display()))?;
+        let file_url = file_url_from_path(&path)?;
+        self.placeholder_file_url = Some(file_url.clone());
+        Ok(file_url)
+    }
+
+    fn cleanup(&mut self) {
+        if self.root.exists() {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+        self.remote_urls.clear();
+        self.placeholder_file_url = None;
+    }
+}
+
+enum RemoteImageState {
+    Pending,
+    Ready(String),
+    Failed,
+}
+
+fn fetch_remote_image_to_cache(image_url: &str, root: &Path, file_index: usize) -> Result<String> {
+    let request_url = validate_remote_image_url(image_url)?;
+    let agent = ureq::AgentBuilder::new()
+        .https_only(true)
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build();
+    let response = fetch_remote_image_response(&agent, request_url)?;
+
+    let content_type = response
+        .header("Content-Type")
+        .and_then(|value| value.split(';').next())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let extension_from_type = image_extension_from_content_type(&content_type);
+    if !content_type.is_empty()
+        && content_type != "application/octet-stream"
+        && extension_from_type.is_none()
+    {
+        bail!("remote image returned unsupported content type");
+    }
+
+    if let Some(length) = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if length > REMOTE_IMAGE_MAX_BYTES {
+            bail!("remote image is larger than the configured limit");
+        }
+    }
+
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(REMOTE_IMAGE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("failed to read remote image body")?;
+    if bytes.len() as u64 > REMOTE_IMAGE_MAX_BYTES {
+        bail!("remote image exceeded the configured limit");
+    }
+    let extension = image_extension_from_magic(&bytes)
+        .context("remote image body did not match a supported image format")?;
+    if let Some(content_type_extension) = extension_from_type {
+        if content_type_extension != extension {
+            bail!("remote image content type did not match image bytes");
+        }
+    }
+
+    let path = root.join(format!("remote-image-{file_index:04}.{extension}"));
+    let partial_path = path.with_extension(format!("{extension}.part"));
+    fs::write(&partial_path, bytes)
+        .with_context(|| format!("failed to cache remote image {}", path.display()))?;
+    fs::rename(&partial_path, &path)
+        .with_context(|| format!("failed to finalize cached image {}", path.display()))?;
+    file_url_from_path(&path)
+}
+
+fn fetch_remote_image_response(
+    agent: &ureq::Agent,
+    mut request_url: Url,
+) -> Result<ureq::Response> {
+    for redirect_count in 0..=REMOTE_IMAGE_MAX_REDIRECTS {
+        validate_remote_image_host_addresses(&request_url)?;
+        let response = match agent
+            .get(request_url.as_str())
+            .set(
+                "Accept",
+                "image/png,image/jpeg,image/gif,image/webp,image/bmp;q=0.8",
+            )
+            .call()
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) if is_redirect_status(status) => response,
+            Err(ureq::Error::Status(status, _)) => {
+                bail!("remote image returned HTTP {status}");
+            }
+            Err(error) => return Err(error).context("failed to fetch remote image"),
+        };
+
+        if is_redirect_status(response.status()) {
+            if redirect_count == REMOTE_IMAGE_MAX_REDIRECTS {
+                bail!("remote image exceeded redirect limit");
+            }
+            let location = response
+                .header("Location")
+                .context("remote image redirect did not include a Location header")?;
+            let next_url = request_url
+                .join(location)
+                .context("remote image redirect target was not valid")?;
+            request_url = validate_remote_image_url(next_url.as_str())?;
+            continue;
+        }
+
+        let response_url = validate_remote_image_url(response.get_url())?;
+        validate_remote_image_host_addresses(&response_url)?;
+        return Ok(response);
+    }
+
+    bail!("remote image exceeded redirect limit")
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 300 | 301 | 302 | 303 | 307 | 308)
+}
+
+impl Drop for ImageCache {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+fn create_window_image_cache_dir() -> Result<PathBuf> {
+    let base = env::temp_dir().join("Markdown Reader");
+    fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create image cache root {}", base.display()))?;
+    cleanup_stale_image_cache_dirs(&base);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let process_id = std::process::id();
+
+    for attempt in 0..100u32 {
+        let candidate = base.join(format!("images-{process_id}-{timestamp}-{attempt}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create image cache {}", candidate.display())
+                });
+            }
+        }
+    }
+
+    bail!("failed to create a unique image cache directory")
+}
+
+fn cleanup_stale_image_cache_dirs(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("images-"))
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified
+            .elapsed()
+            .is_ok_and(|age| age > Duration::from_secs(24 * 60 * 60))
+        {
+            let _ = fs::remove_dir_all(path);
         }
     }
 }
@@ -358,9 +658,15 @@ const THEMES: &[ThemeDefinition] = &[
     },
 ];
 
-fn build_app_html(markdown: &str, settings: &AppSettings) -> Result<String> {
+fn build_app_html(
+    markdown: &str,
+    document_path: &Path,
+    settings: &AppSettings,
+    image_cache: &mut ImageCache,
+) -> Result<String> {
     let expanded_markdown = expand_toc_markers(markdown);
-    let rendered = render_markdown_safely(&expanded_markdown);
+    let rendered =
+        render_markdown_for_document(&expanded_markdown, document_path, settings, image_cache);
     let markdown_json = serde_json::to_string(&expanded_markdown)?;
     let rendered_json = serde_json::to_string(&rendered)?;
     let themes_json = serde_json::to_string(THEMES)?;
@@ -443,6 +749,15 @@ fn notify_open_link_failed(webview: &WebView, message: &str) {
 fn notify_back_history_changed(webview: &WebView, can_go_back: bool) {
     let _ = webview.evaluate_script(&format!(
         "window.__mdReaderSetCanGoBack && window.__mdReaderSetCanGoBack({can_go_back});"
+    ));
+}
+
+fn notify_remote_image_ready(webview: &WebView, source: &str, file_url: Option<&str>) {
+    let source_json = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".into());
+    let file_url_json =
+        serde_json::to_string(&file_url.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
+    let _ = webview.evaluate_script(&format!(
+        "window.__mdReaderRemoteImageReady && window.__mdReaderRemoteImageReady({source_json}, {file_url_json});"
     ));
 }
 
@@ -547,6 +862,7 @@ fn normalize_settings(settings: &AppSettings) -> AppSettings {
             &settings.allowed_launch_extensions,
         ),
         link_click_behavior: normalize_link_click_behavior(&settings.link_click_behavior),
+        allow_remote_images: settings.allow_remote_images,
     }
 }
 
@@ -627,13 +943,21 @@ fn navigate_to_link_target(
     window: &Window,
     href: &str,
     settings: &AppSettings,
+    image_cache: &mut ImageCache,
 ) -> Result<()> {
     let target = resolve_link_target_with_settings(current_path, href, settings)?;
     let LinkTarget::Document(next_path) = target else {
         return open_link_target(current_path, href, settings);
     };
 
-    load_document_path(current_path, next_path, webview, window)
+    load_document_path(
+        current_path,
+        next_path,
+        webview,
+        window,
+        settings,
+        image_cache,
+    )
 }
 
 fn load_document_path(
@@ -641,6 +965,8 @@ fn load_document_path(
     next_path: PathBuf,
     webview: Option<&WebView>,
     window: &Window,
+    settings: &AppSettings,
+    image_cache: &mut ImageCache,
 ) -> Result<()> {
     let Some(webview) = webview else {
         bail!("reader window is not available for navigation");
@@ -648,7 +974,8 @@ fn load_document_path(
     let markdown = fs::read_to_string(&next_path)
         .with_context(|| format!("failed to read linked document {}", next_path.display()))?;
     let expanded_markdown = expand_toc_markers(&markdown);
-    let rendered_html = render_markdown_safely(&expanded_markdown);
+    let rendered_html =
+        render_markdown_for_document(&expanded_markdown, &next_path, settings, image_cache);
 
     load_document_html(webview, &expanded_markdown, &rendered_html)?;
     *current_path = next_path;
@@ -853,6 +1180,201 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+fn file_url_from_path(path: &Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve current directory for file URL")?
+            .join(path)
+    };
+    let normalized = absolute.to_string_lossy().replace('\\', "/");
+
+    #[cfg(windows)]
+    let url = if normalized.starts_with("//") {
+        format!("file:{}", percent_encode_file_url_path(&normalized))
+    } else {
+        format!("file:///{}", percent_encode_file_url_path(&normalized))
+    };
+
+    #[cfg(not(windows))]
+    let url = format!("file://{}", percent_encode_file_url_path(&normalized));
+
+    Ok(url)
+}
+
+fn percent_encode_file_url_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+fn image_extension_from_content_type(content_type: &str) -> Option<String> {
+    match content_type.trim().to_ascii_lowercase().as_str() {
+        "image/bmp" | "image/x-ms-bmp" => Some("bmp".to_string()),
+        "image/gif" => Some("gif".to_string()),
+        "image/jpeg" | "image/jpg" => Some("jpg".to_string()),
+        "image/png" => Some("png".to_string()),
+        "image/webp" => Some("webp".to_string()),
+        _ => None,
+    }
+}
+
+fn image_extension_from_magic(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        return Some("png".to_string());
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg".to_string());
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif".to_string());
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("bmp".to_string());
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("webp".to_string());
+    }
+    None
+}
+
+fn normalize_image_extension(extension: &str) -> Option<String> {
+    let extension = extension
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if DEFAULT_IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+        Some(extension)
+    } else {
+        None
+    }
+}
+
+fn has_common_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(normalize_image_extension)
+        .is_some()
+}
+
+fn ensure_image_path_is_renderable(path: &Path) -> Result<()> {
+    if !has_common_image_extension(path) {
+        bail!("blocked image with unsupported extension");
+    }
+    if !path.is_file() {
+        bail!("image file does not exist");
+    }
+    Ok(())
+}
+
+fn validate_remote_image_url(image_url: &str) -> Result<Url> {
+    let url = Url::parse(image_url).context("remote image URL is not valid")?;
+    if url.scheme() != "https" {
+        bail!("remote images must use https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("remote image URLs cannot include credentials");
+    }
+
+    match url.host().context("remote image URL must include a host")? {
+        url::Host::Ipv4(address) => ensure_remote_image_ip_is_public(IpAddr::V4(address))?,
+        url::Host::Ipv6(address) => ensure_remote_image_ip_is_public(IpAddr::V6(address))?,
+        url::Host::Domain(host) => {
+            let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+            if host.is_empty() {
+                bail!("remote image URL must include a host");
+            }
+            if host == "localhost" || host.ends_with(".localhost") {
+                bail!("remote image host is local-only");
+            }
+        }
+    }
+    Ok(url)
+}
+
+fn validate_remote_image_host_addresses(url: &Url) -> Result<()> {
+    let host = remote_image_host_for_resolution(url)?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = (host.as_str(), port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve remote image host {host}"))?;
+    let mut found_address = false;
+    for address in addresses {
+        found_address = true;
+        ensure_remote_image_ip_is_public(address.ip())?;
+    }
+    if !found_address {
+        bail!("remote image host did not resolve");
+    }
+    Ok(())
+}
+
+fn remote_image_host_for_resolution(url: &Url) -> Result<String> {
+    match url.host().context("remote image URL must include a host")? {
+        url::Host::Ipv4(address) => Ok(address.to_string()),
+        url::Host::Ipv6(address) => Ok(address.to_string()),
+        url::Host::Domain(host) => Ok(host.trim().trim_end_matches('.').to_ascii_lowercase()),
+    }
+}
+
+fn ensure_remote_image_ip_is_public(ip_address: IpAddr) -> Result<()> {
+    match ip_address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            let is_shared = octets[0] == 100 && (octets[1] & 0b1100_0000) == 64;
+            let is_benchmarking = octets[0] == 198 && matches!(octets[1], 18 | 19);
+            if address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_unspecified()
+                || is_shared
+                || is_benchmarking
+            {
+                bail!("remote image host is not public");
+            }
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return ensure_remote_image_ip_is_public(IpAddr::V4(mapped));
+            }
+            if address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast()
+            {
+                bail!("remote image host is not public");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_rendered_image_src(src: &str) -> bool {
+    let Some(scheme) = href_scheme(src.trim()) else {
+        return false;
+    };
+
+    if !scheme.eq_ignore_ascii_case("file") {
+        return false;
+    }
+
+    file_url_to_path(src)
+        .map(|path| has_common_image_extension(&path))
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -1126,7 +1648,38 @@ fn slugify_heading(text: &str) -> Option<String> {
     }
 }
 
+struct ImageRewriteContext<'a> {
+    document_path: &'a Path,
+    settings: &'a AppSettings,
+    cache: Option<&'a mut ImageCache>,
+}
+
+fn render_markdown_for_document(
+    markdown: &str,
+    document_path: &Path,
+    settings: &AppSettings,
+    image_cache: &mut ImageCache,
+) -> String {
+    let settings = normalize_settings(settings);
+    render_markdown_internal(
+        markdown,
+        Some(ImageRewriteContext {
+            document_path,
+            settings: &settings,
+            cache: Some(image_cache),
+        }),
+    )
+}
+
+#[cfg(test)]
 fn render_markdown_safely(markdown: &str) -> String {
+    render_markdown_internal(markdown, None)
+}
+
+fn render_markdown_internal(
+    markdown: &str,
+    mut image_context: Option<ImageRewriteContext<'_>>,
+) -> String {
     let markdown = expand_toc_markers(markdown);
     let heading_ids = collect_markdown_headings(&markdown)
         .into_iter()
@@ -1138,43 +1691,219 @@ fn render_markdown_safely(markdown: &str) -> String {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    options.insert(Options::ENABLE_DEFINITION_LIST);
+    options.insert(Options::ENABLE_SUBSCRIPT);
+    options.insert(Options::ENABLE_SUPERSCRIPT);
+    options.insert(Options::ENABLE_MATH);
 
-    let parser = Parser::new_ext(&markdown, options);
+    let mut parser = Parser::new_ext(&markdown, options);
     let mut next_heading_index = 0usize;
-    let indexed_events = parser.map(move |event| match event {
-        Event::Start(Tag::Heading { level, .. }) => {
-            let tag = heading_tag(level);
-            let index = next_heading_index;
-            next_heading_index += 1;
-            let heading_id = heading_ids
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| format!("section-{index}"));
-            // The data attribute is the bridge between Rust-rendered headings and
-            // JavaScript scroll restoration. The id is human-readable for TOC
-            // links; the data index remains stable while the user edits headings.
-            Event::Html(
-                format!(r#"<{tag} id="{heading_id}" data-md-section-index="{index}">"#).into(),
-            )
+    let mut indexed_events = Vec::new();
+
+    while let Some(event) = parser.next() {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                let tag = heading_tag(level);
+                let index = next_heading_index;
+                next_heading_index += 1;
+                let heading_id = heading_ids
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| format!("section-{index}"));
+                // The data attribute is the bridge between Rust-rendered headings and
+                // JavaScript scroll restoration. The id is human-readable for TOC
+                // links; the data index remains stable while the user edits headings.
+                indexed_events.push(Event::Html(
+                    format!(r#"<{tag} id="{heading_id}" data-md-section-index="{index}">"#).into(),
+                ));
+            }
+            Event::End(TagEnd::Heading(level)) => {
+                indexed_events.push(Event::Html(format!("</{}>", heading_tag(level)).into()));
+            }
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
+                let alt = collect_image_alt_text(&mut parser);
+                indexed_events.push(Event::Html(
+                    markdown_image_html(
+                        dest_url.as_ref(),
+                        title.as_ref(),
+                        &alt,
+                        image_context.as_mut(),
+                    )
+                    .into(),
+                ));
+            }
+            Event::End(TagEnd::Image) => {}
+            other => indexed_events.push(other),
         }
-        Event::End(TagEnd::Heading(level)) => {
-            Event::Html(format!("</{}>", heading_tag(level)).into())
-        }
-        other => other,
-    });
+    }
 
     let mut unsafe_html = String::new();
-    html::push_html(&mut unsafe_html, indexed_events);
+    html::push_html(&mut unsafe_html, indexed_events.into_iter());
     sanitize_rendered_html(&unsafe_html)
+}
+
+fn collect_image_alt_text<'a>(parser: &mut Parser<'a>) -> String {
+    let mut alt = String::new();
+    let mut depth = 1usize;
+
+    while let Some(event) = parser.next() {
+        match event {
+            Event::Start(Tag::Image { .. }) => {
+                depth += 1;
+            }
+            Event::End(TagEnd::Image) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            Event::Text(text) | Event::Code(text) => alt.push_str(text.as_ref()),
+            Event::SoftBreak | Event::HardBreak => alt.push(' '),
+            _ => {}
+        }
+    }
+
+    alt
+}
+
+fn markdown_image_html(
+    original_src: &str,
+    title: &str,
+    alt: &str,
+    image_context: Option<&mut ImageRewriteContext<'_>>,
+) -> String {
+    let resolved_src =
+        image_context.and_then(
+            |context| match resolve_markdown_image_src(context, original_src) {
+                Ok(src) => Some(src),
+                Err(_) => context
+                    .cache
+                    .as_deref_mut()
+                    .and_then(|cache| cache.placeholder_file_url().ok()),
+            },
+        );
+    let src_attr = resolved_src
+        .as_deref()
+        .filter(|src| !src.trim().is_empty())
+        .map(|src| format!(r#" src="{}""#, escape_html_attribute(src)))
+        .unwrap_or_default();
+    let title_attr = if title.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#" title="{}" data-md-title="{}""#,
+            escape_html_attribute(title),
+            escape_html_attribute(title)
+        )
+    };
+
+    format!(
+        r#"<img{src_attr} alt="{}" data-md-src="{}"{title_attr} />"#,
+        escape_html_attribute(alt),
+        escape_html_attribute(original_src)
+    )
+}
+
+fn resolve_markdown_image_src(
+    context: &mut ImageRewriteContext<'_>,
+    original_src: &str,
+) -> Result<String> {
+    let trimmed = original_src.trim();
+    if trimmed.is_empty() {
+        bail!("image source is empty");
+    }
+
+    if let Some(scheme) = href_scheme(trimmed) {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "file" => {
+                let path = file_url_to_path(trimmed)?;
+                ensure_image_path_is_renderable(&path)?;
+                file_url_from_path(&path)
+            }
+            "http" | "https" => {
+                if !context.settings.allow_remote_images {
+                    bail!("remote images are disabled");
+                }
+                let Some(cache) = context.cache.as_deref_mut() else {
+                    bail!("image cache is not available");
+                };
+                cache.remote_file_url(trimmed)
+            }
+            _ => bail!("blocked unsupported image scheme: {scheme}"),
+        };
+    }
+
+    let path_part = strip_link_fragment_and_query(trimmed);
+    let decoded = percent_decode_path(path_part)?;
+    if decoded.trim().is_empty() {
+        bail!("image source does not include a path");
+    }
+
+    let image_path = PathBuf::from(decoded);
+    let resolved = if image_path.is_absolute() {
+        image_path
+    } else {
+        context
+            .document_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(image_path)
+    };
+
+    ensure_image_path_is_renderable(&resolved)?;
+    file_url_from_path(&resolved)
+}
+
+fn escape_html_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn sanitize_rendered_html(unsafe_html: &str) -> String {
     let mut builder = ammonia::Builder::default();
     builder.add_generic_attributes(&["id"]);
+    builder.add_url_schemes(&["file"]);
+    builder.add_tags(&["input"]);
+    builder.add_tag_attributes("input", &["type", "checked", "disabled"]);
+    builder.set_tag_attribute_value("input", "disabled", "");
+    builder.add_tag_attributes("img", &["data-md-src", "data-md-title"]);
+    builder.add_tag_attributes("div", &["class"]);
+    builder.add_tag_attributes("span", &["class"]);
+    builder.add_tag_attributes("sup", &["class"]);
     for tag in ["h1", "h2", "h3", "h4", "h5", "h6"] {
         builder.add_tag_attributes(tag, &["data-md-section-index"]);
     }
+    builder.attribute_filter(|element, attribute, value| match (element, attribute) {
+        ("img", "src") if is_safe_rendered_image_src(value) => Some(value.into()),
+        ("img", "src") => None,
+        ("input", "type") if value.eq_ignore_ascii_case("checkbox") => Some("checkbox".into()),
+        ("input", "checked" | "disabled") => Some(String::new().into()),
+        ("input", _) => None,
+        ("div", "class") => allowed_css_classes(value, &["footnote-definition"]),
+        ("span", "class") => allowed_css_classes(value, &["math", "math-inline", "math-display"]),
+        ("sup", "class") => {
+            allowed_css_classes(value, &["footnote-definition-label", "footnote-reference"])
+        }
+        _ => Some(value.into()),
+    });
     builder.clean(unsafe_html).to_string()
+}
+
+fn allowed_css_classes(value: &str, allowed: &[&str]) -> Option<std::borrow::Cow<'static, str>> {
+    let classes = value
+        .split_ascii_whitespace()
+        .filter(|class| allowed.contains(class))
+        .collect::<Vec<_>>();
+    if classes.is_empty() {
+        None
+    } else {
+        Some(classes.join(" ").into())
+    }
 }
 
 fn heading_tag(level: HeadingLevel) -> &'static str {
@@ -1188,7 +1917,7 @@ fn heading_tag(level: HeadingLevel) -> &'static str {
     }
 }
 
-const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
+const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -1561,15 +2290,69 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       padding: 16px;
     }
 
-    .field {
-      display: grid;
+	    .field {
+	      display: grid;
+	      gap: 6px;
+	      font-size: 13px;
+	      color: var(--muted);
+	    }
+
+    .field-label {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
       gap: 6px;
-      font-size: 13px;
-      color: var(--muted);
+	    }
+
+	    .help-button {
+	      width: 18px;
+	      height: 18px;
+      border-radius: 50%;
+      font: 600 12px/1 "Segoe UI", system-ui, sans-serif;
     }
 
-    .settings-body select,
-    .settings-body textarea,
+    .help-wrap {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    .help-tooltip {
+      position: absolute;
+      left: calc(100% + 8px);
+      top: 50%;
+      z-index: 30;
+      width: min(330px, calc(100vw - 96px));
+      padding: 8px 10px;
+      color: var(--ink);
+      background: var(--dialog, var(--surface));
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      box-shadow: 0 10px 24px var(--dialog-shadow, rgba(0, 0, 0, 0.22));
+      font: 12px/1.35 "Segoe UI", system-ui, sans-serif;
+      transform: translateY(-50%);
+      display: none;
+    }
+
+    .help-wrap:hover .help-tooltip,
+    .help-wrap:focus-within .help-tooltip,
+    .help-tooltip.visible {
+      display: block;
+    }
+
+	    .checkbox-field {
+	      grid-template-columns: minmax(0, 1fr) auto;
+	      align-items: center;
+	    }
+
+	    .settings-body input[type="checkbox"] {
+	      width: 18px;
+	      height: 18px;
+	      accent-color: var(--accent);
+	    }
+
+	    .settings-body select,
+	    .settings-body textarea,
     .settings-button {
       width: 100%;
       min-height: 32px;
@@ -1669,17 +2452,26 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
           <path d="M4 18h.01"></path>
         </svg>
       </button>
-      <button class="icon-button" type="button" data-command="insertOrderedList" title="Numbered list" aria-label="Numbered list">
-        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M10 6h10"></path>
-          <path d="M10 12h10"></path>
-          <path d="M10 18h10"></path>
+	      <button class="icon-button" type="button" data-command="insertOrderedList" title="Numbered list" aria-label="Numbered list">
+	        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+	          <path d="M10 6h10"></path>
+	          <path d="M10 12h10"></path>
+	          <path d="M10 18h10"></path>
           <path d="M4 6h1v4"></path>
           <path d="M4 10h2"></path>
-          <path d="M4 14h2l-2 4h2"></path>
-        </svg>
-      </button>
-    </div>
+	          <path d="M4 14h2l-2 4h2"></path>
+	        </svg>
+	      </button>
+	      <button id="table-button" class="icon-button" type="button" title="Table" aria-label="Table">
+	        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+	          <path d="M4 5h16v14H4z"></path>
+	          <path d="M4 10h16"></path>
+	          <path d="M4 15h16"></path>
+	          <path d="M10 5v14"></path>
+	          <path d="M16 5v14"></path>
+	        </svg>
+	      </button>
+	    </div>
     <div class="nav-spacer"></div>
     <button id="save-button" class="icon-button saved" type="button" title="Save (Ctrl+S)" aria-label="Save">
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -1720,21 +2512,31 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
           Theme
           <select id="theme-select"></select>
         </label>
-        <label class="field" for="link-click-behavior">
-          Link Click Behavior
-          <select id="link-click-behavior">
-            <option value="newWindow">New window</option>
-            <option value="navigate">Navigate</option>
-          </select>
-        </label>
-        <label class="field" for="custom-css-button">
-          Custom CSS
-          <button id="custom-css-button" class="settings-button" type="button">Choose CSS...</button>
-        </label>
-        <label class="field" for="allowed-launch-extensions">
-          Allowed Link Extensions
-          <textarea id="allowed-launch-extensions" spellcheck="false" placeholder=".ps1, .exe"></textarea>
-        </label>
+	        <label class="field" for="link-click-behavior">
+	          Link Click Behavior
+	          <select id="link-click-behavior">
+	            <option value="newWindow">New window</option>
+	            <option value="navigate">Navigate</option>
+	          </select>
+	        </label>
+	        <label class="field checkbox-field" for="allow-remote-images">
+	          <span>Remote Images</span>
+	          <input id="allow-remote-images" type="checkbox">
+	        </label>
+	        <label class="field" for="custom-css-button">
+	          Custom CSS
+	          <button id="custom-css-button" class="settings-button" type="button">Choose CSS...</button>
+	        </label>
+	        <label class="field" for="allowed-launch-extensions">
+	          <span class="field-label">
+	            Allowed Link Extensions
+	            <span class="help-wrap">
+	              <button id="allowed-extensions-help" class="icon-button help-button" type="button" aria-label="Show default allowed link extensions" aria-describedby="allowed-extensions-help-text" aria-expanded="false">?</button>
+	              <span id="allowed-extensions-help-text" class="help-tooltip" role="tooltip">Allowed by default: links with no extension and extensions that are not executable or script-like (.bat, .cmd, .com, .cpl, .exe, .hta, .jar, .jse, .lnk, .msi, .msp, .ps1, .psm1, .reg, .scr, .url, .vbe, .vbs, .wsf, .wsh).</span>
+	            </span>
+	          </span>
+	          <textarea id="allowed-launch-extensions" spellcheck="false" placeholder=".ps1, .exe"></textarea>
+	        </label>
       </div>
     </section>
   </div>
@@ -1754,29 +2556,35 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const settingsButton = document.getElementById("settings-button");
     const settingsBackdrop = document.getElementById("settings-backdrop");
     const settingsClose = document.getElementById("settings-close");
-    const themeSelect = document.getElementById("theme-select");
-    const linkClickBehaviorSelect = document.getElementById("link-click-behavior");
-    const customCssButton = document.getElementById("custom-css-button");
-    const allowedLaunchExtensionsInput = document.getElementById("allowed-launch-extensions");
+	    const themeSelect = document.getElementById("theme-select");
+	    const linkClickBehaviorSelect = document.getElementById("link-click-behavior");
+	    const allowRemoteImagesInput = document.getElementById("allow-remote-images");
+	    const customCssButton = document.getElementById("custom-css-button");
+	    const allowedLaunchExtensionsInput = document.getElementById("allowed-launch-extensions");
+	    const allowedExtensionsHelpButton = document.getElementById("allowed-extensions-help");
+	    const allowedExtensionsHelpText = document.getElementById("allowed-extensions-help-text");
     const linkMenu = document.getElementById("link-menu");
     const linkMenuAction = document.getElementById("link-menu-action");
     const themeStyle = document.getElementById("theme-style");
     const customThemeStyle = document.getElementById("custom-theme-style");
     const blockFormat = document.getElementById("block-format");
-    const inlineCodeButton = document.getElementById("inline-code-button");
-    const linkButton = document.getElementById("link-button");
+	    const inlineCodeButton = document.getElementById("inline-code-button");
+	    const linkButton = document.getElementById("link-button");
+	    const tableButton = document.getElementById("table-button");
     let dirty = false;
     let renderedDirty = false;
-    let customCss = sanitizeCustomCss(initialSettings.customCss || "");
-    let allowedLaunchExtensions = sanitizeAllowedLaunchExtensions(initialSettings.allowedLaunchExtensions || []);
-    let linkClickBehavior = normalizeLinkClickBehavior(initialSettings.linkClickBehavior);
+	    let customCss = sanitizeCustomCss(initialSettings.customCss || "");
+	    let allowedLaunchExtensions = sanitizeAllowedLaunchExtensions(initialSettings.allowedLaunchExtensions || []);
+	    let linkClickBehavior = normalizeLinkClickBehavior(initialSettings.linkClickBehavior);
+	    let allowRemoteImages = Boolean(initialSettings.allowRemoteImages);
     let linkMenuHref = "";
     let savedRenderedRange = null;
 
     editor.value = initialMarkdown;
     rendered.innerHTML = initialRendered;
-    allowedLaunchExtensionsInput.value = formatAllowedLaunchExtensions(allowedLaunchExtensions);
-    linkClickBehaviorSelect.value = linkClickBehavior;
+	    allowedLaunchExtensionsInput.value = formatAllowedLaunchExtensions(allowedLaunchExtensions);
+	    linkClickBehaviorSelect.value = linkClickBehavior;
+	    allowRemoteImagesInput.checked = allowRemoteImages;
 
     function postMessage(payload) {
       window.ipc.postMessage(JSON.stringify(payload));
@@ -1790,6 +2598,12 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
 
     function setCanGoBack(value) {
       backButton.disabled = !Boolean(value);
+    }
+
+    function setAllowedExtensionsHelpVisible(value) {
+      const visible = Boolean(value);
+      allowedExtensionsHelpText.classList.toggle("visible", visible);
+      allowedExtensionsHelpButton.setAttribute("aria-expanded", visible ? "true" : "false");
     }
 
     function markerFromEditor() {
@@ -1989,13 +2803,19 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       if (tag === "pre") {
         return fencedCode(node.innerText || node.textContent || "");
       }
-      if (tag === "blockquote") {
-        const text = childBlocksMarkdown(node, depth).trim();
-        return text.split("\n").map((line) => line ? `> ${line}` : ">").join("\n");
-      }
-      if (tag === "ul" || tag === "ol") {
-        return listMarkdown(node, tag === "ol", depth);
-      }
+	      if (tag === "blockquote") {
+	        const text = childBlocksMarkdown(node, depth).trim();
+	        return text.split("\n").map((line) => line ? `> ${line}` : ">").join("\n");
+	      }
+	      if (tag === "div" && isFootnoteDefinition(node)) {
+	        return footnoteDefinitionMarkdown(node, depth);
+	      }
+	      if (tag === "dl") {
+	        return definitionListMarkdown(node, depth);
+	      }
+	      if (tag === "ul" || tag === "ol") {
+	        return listMarkdown(node, tag === "ol", depth);
+	      }
       if (tag === "table") {
         return tableMarkdown(node);
       }
@@ -2039,54 +2859,72 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       if (tag === "strong" || tag === "b") {
         return text ? `**${text}**` : "";
       }
-      if (tag === "em" || tag === "i") {
-        return text ? `*${text}*` : "";
-      }
-      if (tag === "code") {
-        return inlineCode(node.textContent || "");
-      }
-      if (tag === "a") {
-        const href = node.getAttribute("href") || "";
-        if (!href || /^\s*javascript:/i.test(href)) {
-          return text;
-        }
-        return `[${text}](${href.replace(/\)/g, "%29")})`;
-      }
-      if (tag === "img") {
-        const alt = normalizeText(node.getAttribute("alt") || "");
-        const src = node.getAttribute("src") || "";
-        return src ? `![${alt}](${src.replace(/\)/g, "%29")})` : alt;
-      }
+	      if (tag === "em" || tag === "i") {
+	        return text ? `*${text}*` : "";
+	      }
+	      if (tag === "del" || tag === "s") {
+	        return text ? `~~${text}~~` : "";
+	      }
+	      if (tag === "code") {
+	        return inlineCode(node.textContent || "");
+	      }
+	      if (tag === "sup") {
+	        const footnote = footnoteReferenceMarkdown(node);
+	        return footnote || (text ? `^${text}^` : "");
+	      }
+	      if (tag === "sub") {
+	        return text ? `~${text}~` : "";
+	      }
+	      if (tag === "span" && isMathSpan(node)) {
+	        return mathMarkdown(node);
+	      }
+	      if (tag === "a") {
+	        const href = node.getAttribute("href") || "";
+	        if (!href || /^\s*javascript:/i.test(href)) {
+	          return text;
+	        }
+	        return `[${text}](${markdownDestination(href)})`;
+	      }
+	      if (tag === "img") {
+	        const alt = normalizeText(node.getAttribute("alt") || "");
+	        const src = node.getAttribute("data-md-src") || node.getAttribute("src") || "";
+	        const title = node.getAttribute("data-md-title") || node.getAttribute("title") || "";
+	        return src ? `![${alt}](${markdownDestination(src)}${title ? ` "${markdownTitle(title)}"` : ""})` : alt;
+	      }
       if (tag === "br") {
         return "\n";
       }
       return text;
     }
 
-    function listMarkdown(list, ordered, depth) {
-      const lines = [];
-      let ordinal = 1;
-      for (const item of Array.from(list.children).filter((child) => child.tagName.toLowerCase() === "li")) {
-        const marker = ordered ? `${ordinal}. ` : "- ";
-        ordinal += 1;
-        const content = listItemMarkdown(item, depth + 1);
-        const contentLines = content.split("\n");
-        const indent = "  ".repeat(depth);
-        lines.push(`${indent}${marker}${contentLines[0] || ""}`);
-        for (const line of contentLines.slice(1)) {
-          lines.push(`${indent}  ${line}`);
-        }
+	    function listMarkdown(list, ordered, depth) {
+	      const lines = [];
+	      let ordinal = 1;
+	      for (const item of Array.from(list.children).filter((child) => child.tagName.toLowerCase() === "li")) {
+	        const marker = ordered ? `${ordinal}. ` : "- ";
+	        ordinal += 1;
+	        const taskMarker = taskListPrefix(item);
+	        const content = listItemMarkdown(item, depth + 1);
+	        const contentLines = content.split("\n");
+	        const indent = "  ".repeat(depth);
+	        lines.push(`${indent}${marker}${taskMarker}${contentLines[0] || ""}`);
+	        for (const line of contentLines.slice(1)) {
+	          lines.push(`${indent}  ${line}`);
+	        }
       }
       return lines.join("\n");
     }
 
     function listItemMarkdown(item, depth) {
       const parts = [];
-      let inlineParts = [];
-      for (const child of item.childNodes) {
-        if (child.nodeType === Node.ELEMENT_NODE && /^(ul|ol|p|pre|blockquote|table)$/.test(child.tagName.toLowerCase())) {
-          if (inlineParts.join("").trim()) {
-            parts.push(inlineParts.join("").trim());
+	      let inlineParts = [];
+	      for (const child of item.childNodes) {
+	        if (isTaskCheckbox(child)) {
+	          continue;
+	        }
+	        if (child.nodeType === Node.ELEMENT_NODE && /^(ul|ol|p|pre|blockquote|table|dl|div)$/.test(child.tagName.toLowerCase())) {
+	          if (inlineParts.join("").trim()) {
+	            parts.push(inlineParts.join("").trim());
             inlineParts = [];
           }
           parts.push(blockMarkdown(child, depth));
@@ -2097,10 +2935,113 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       if (inlineParts.join("").trim()) {
         parts.push(inlineParts.join("").trim());
       }
-      return parts.join("\n");
-    }
+	      return parts.join("\n");
+	    }
 
-    function tableMarkdown(table) {
+	    function taskListPrefix(item) {
+	      const checkbox = Array.from(item.childNodes).find(isTaskCheckbox);
+	      if (!checkbox) {
+	        return "";
+	      }
+	      return checkbox.checked || checkbox.hasAttribute("checked") ? "[x] " : "[ ] ";
+	    }
+
+	    function isTaskCheckbox(node) {
+	      return node.nodeType === Node.ELEMENT_NODE
+	        && node.tagName.toLowerCase() === "input"
+	        && (node.getAttribute("type") || "").toLowerCase() === "checkbox";
+	    }
+
+	    function footnoteReferenceMarkdown(node) {
+	      if (!node.classList.contains("footnote-reference")) {
+	        return "";
+	      }
+	      const anchor = node.querySelector("a[href]");
+	      const href = anchor ? anchor.getAttribute("href") || "" : "";
+	      const label = footnoteLabelFromHref(href);
+	      return label ? `[^${label}]` : "";
+	    }
+
+	    function isFootnoteDefinition(node) {
+	      return node.classList.contains("footnote-definition")
+	        && Boolean(footnoteLabelFromId(node.getAttribute("id") || ""));
+	    }
+
+	    function footnoteDefinitionMarkdown(node, depth) {
+	      const label = footnoteLabelFromId(node.getAttribute("id") || "");
+	      const clone = node.cloneNode(true);
+	      const labelNode = clone.querySelector("sup");
+	      if (labelNode) {
+	        labelNode.remove();
+	      }
+	      const text = childBlocksMarkdown(clone, depth).trim();
+	      const lines = text.split("\n");
+	      const first = lines.shift() || "";
+	      const rest = lines.map((line) => line ? `    ${line}` : "").join("\n");
+	      return rest ? `[^${label}]: ${first}\n${rest}` : `[^${label}]: ${first}`;
+	    }
+
+	    function footnoteLabelFromHref(href) {
+	      if (!href.startsWith("#")) {
+	        return "";
+	      }
+	      return footnoteLabelFromId(href.slice(1));
+	    }
+
+	    function footnoteLabelFromId(id) {
+	      const trimmed = normalizeText(id || "").trim();
+	      if (!trimmed) {
+	        return "";
+	      }
+	      try {
+	        return decodeURIComponent(trimmed);
+	      } catch (_) {
+	        return trimmed;
+	      }
+	    }
+
+	    function definitionListMarkdown(list, depth) {
+	      const blocks = [];
+	      let currentTerm = "";
+	      for (const child of Array.from(list.children)) {
+	        const tag = child.tagName.toLowerCase();
+	        if (tag === "dt") {
+	          currentTerm = inlineMarkdown(child).trim();
+	          if (currentTerm) {
+	            blocks.push(currentTerm);
+	          }
+	        } else if (tag === "dd") {
+	          const definition = childBlocksMarkdown(child, depth + 1).trim() || inlineMarkdown(child).trim();
+	          const lines = definition.split("\n");
+	          const first = lines.shift() || "";
+	          const rest = lines.map((line) => line ? `  ${line}` : "").join("\n");
+	          blocks.push(rest ? `: ${first}\n${rest}` : `: ${first}`);
+	        }
+	      }
+	      return blocks.join("\n");
+	    }
+
+	    function isMathSpan(node) {
+	      return node.classList.contains("math-inline") || node.classList.contains("math-display");
+	    }
+
+	    function mathMarkdown(node) {
+	      const text = normalizeText(node.textContent || "");
+	      if (node.classList.contains("math-display")) {
+	        return text ? `$$${text}$$` : "";
+	      }
+	      return text ? `$${text}$` : "";
+	    }
+
+	    function markdownDestination(destination) {
+	      return normalizeText(destination).replace(/\)/g, "%29");
+	    }
+
+	    function markdownTitle(title) {
+	      return normalizeText(title).replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+	    }
+
+	    function tableMarkdown(table) {
       const rows = Array.from(table.querySelectorAll("tr")).map((row) =>
         Array.from(row.children)
           .filter((cell) => /^(th|td)$/.test(cell.tagName.toLowerCase()))
@@ -2191,18 +3132,20 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       }
     }
 
-    function saveSettings(themeId) {
-      linkClickBehavior = normalizeLinkClickBehavior(linkClickBehaviorSelect.value);
-      postMessage({
-        kind: "saveSettings",
-        settings: {
-          themeId,
-          customCss,
-          allowedLaunchExtensions,
-          linkClickBehavior
-        }
-      });
-    }
+	    function saveSettings(themeId) {
+	      linkClickBehavior = normalizeLinkClickBehavior(linkClickBehaviorSelect.value);
+	      allowRemoteImages = Boolean(allowRemoteImagesInput.checked);
+	      postMessage({
+	        kind: "saveSettings",
+	        settings: {
+	          themeId,
+	          customCss,
+	          allowedLaunchExtensions,
+	          linkClickBehavior,
+	          allowRemoteImages
+	        }
+	      });
+	    }
 
     function pickCustomCss() {
       postMessage({ kind: "pickCustomCss" });
@@ -2256,11 +3199,21 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       saveSettings(themeSelect.value);
     }
 
-    function saveLinkClickBehavior() {
-      linkClickBehavior = normalizeLinkClickBehavior(linkClickBehaviorSelect.value);
-      linkClickBehaviorSelect.value = linkClickBehavior;
-      saveSettings(themeSelect.value);
-    }
+	    function saveLinkClickBehavior() {
+	      linkClickBehavior = normalizeLinkClickBehavior(linkClickBehaviorSelect.value);
+	      linkClickBehaviorSelect.value = linkClickBehavior;
+	      saveSettings(themeSelect.value);
+	    }
+
+	    function saveAllowRemoteImages() {
+	      allowRemoteImages = Boolean(allowRemoteImagesInput.checked);
+	      saveSettings(themeSelect.value);
+	      if (toggle.checked) {
+	        const marker = markerFromRendered();
+	        commitRenderedEditsToMarkdown();
+	        postMessage({ kind: "render", markdown: editor.value, marker });
+	      }
+	    }
 
     function openSettings() {
       hideLinkMenu();
@@ -2364,11 +3317,11 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       markRenderedEdited();
     }
 
-    function applyLink() {
-      restoreRenderedSelection();
-      const url = window.prompt("URL");
-      if (!url) {
-        return;
+	    function applyLink() {
+	      restoreRenderedSelection();
+	      const url = window.prompt("URL");
+	      if (!url) {
+	        return;
       }
 
       const selection = window.getSelection();
@@ -2377,11 +3330,47 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
         document.execCommand("insertHTML", false, `<a href="${escapeAttribute(url)}">${escapeHtml(label)}</a>`);
       } else {
         document.execCommand("createLink", false, url);
-      }
-      markRenderedEdited();
-    }
+	      }
+	      markRenderedEdited();
+	    }
 
-    function escapeHtml(text) {
+	    function applyTable() {
+	      restoreRenderedSelection();
+	      const rows = promptPositiveInteger("Rows including header", 3, 1, 25);
+	      if (!rows) {
+	        return;
+	      }
+	      const columns = promptPositiveInteger("Columns", 3, 1, 12);
+	      if (!columns) {
+	        return;
+	      }
+
+	      document.execCommand("insertHTML", false, tableHtml(rows, columns));
+	      markRenderedEdited();
+	    }
+
+	    function promptPositiveInteger(label, fallback, min, max) {
+	      const answer = window.prompt(label, String(fallback));
+	      if (answer === null) {
+	        return null;
+	      }
+	      const value = Number.parseInt(answer, 10);
+	      if (!Number.isFinite(value) || value < min || value > max) {
+	        return fallback;
+	      }
+	      return value;
+	    }
+
+	    function tableHtml(rows, columns) {
+	      const headCells = Array.from({ length: columns }, (_, index) => `<th>Header ${index + 1}</th>`).join("");
+	      const bodyRows = Array.from({ length: Math.max(0, rows - 1) }, (_, rowIndex) => {
+	        const cells = Array.from({ length: columns }, (_, columnIndex) => `<td>Cell ${rowIndex + 1}.${columnIndex + 1}</td>`).join("");
+	        return `<tr>${cells}</tr>`;
+	      }).join("");
+	      return `<table><thead><tr>${headCells}</tr></thead><tbody>${bodyRows}</tbody></table>`;
+	    }
+
+	    function escapeHtml(text) {
       return normalizeText(text)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -2420,6 +3409,17 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     };
 
     window.__mdReaderSetCanGoBack = setCanGoBack;
+
+    window.__mdReaderRemoteImageReady = (source, fileUrl) => {
+      if (!source || !fileUrl) {
+        return;
+      }
+      for (const image of rendered.querySelectorAll("img[data-md-src]")) {
+        if (image.getAttribute("data-md-src") === source) {
+          image.setAttribute("src", fileUrl);
+        }
+      }
+    };
 
     window.__mdReaderSaveFinished = (ok, message) => {
       if (ok) {
@@ -2480,6 +3480,13 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     });
 
     linkClickBehaviorSelect.addEventListener("change", saveLinkClickBehavior);
+    allowRemoteImagesInput.addEventListener("change", saveAllowRemoteImages);
+    allowedExtensionsHelpButton.addEventListener("click", () => {
+      setAllowedExtensionsHelpVisible(allowedExtensionsHelpButton.getAttribute("aria-expanded") !== "true");
+    });
+    allowedExtensionsHelpButton.addEventListener("blur", () => {
+      setAllowedExtensionsHelpVisible(false);
+    });
 
     customCssButton.addEventListener("click", pickCustomCss);
     allowedLaunchExtensionsInput.addEventListener("change", saveAllowedLaunchExtensions);
@@ -2496,10 +3503,13 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     inlineCodeButton.addEventListener("mousedown", (event) => event.preventDefault());
     inlineCodeButton.addEventListener("click", applyInlineCode);
 
-    linkButton.addEventListener("mousedown", (event) => event.preventDefault());
-    linkButton.addEventListener("click", applyLink);
+	    linkButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    linkButton.addEventListener("click", applyLink);
 
-    editor.addEventListener("input", () => {
+	    tableButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    tableButton.addEventListener("click", applyTable);
+
+	    editor.addEventListener("input", () => {
       setDirty(true);
     });
 
@@ -2538,6 +3548,11 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
       if (event.key === "Escape" && !linkMenu.hidden) {
         event.preventDefault();
         hideLinkMenu();
+      }
+      if (event.key === "Escape" && allowedExtensionsHelpButton.getAttribute("aria-expanded") === "true") {
+        event.preventDefault();
+        setAllowedExtensionsHelpVisible(false);
+        allowedExtensionsHelpButton.focus();
       }
     });
 
@@ -2589,9 +3604,10 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
     const storedTheme = initialSettings.themeId || "clean";
     const themeIsKnown = storedTheme === "custom" ? Boolean(customCss) : themes.some((theme) => theme.id === storedTheme);
     const initialTheme = themeIsKnown ? storedTheme : "clean";
-    themeSelect.value = initialTheme;
-    linkClickBehaviorSelect.value = linkClickBehavior;
-    applyTheme(initialTheme, false);
+	    themeSelect.value = initialTheme;
+	    linkClickBehaviorSelect.value = linkClickBehavior;
+	    allowRemoteImagesInput.checked = allowRemoteImages;
+	    applyTheme(initialTheme, false);
     document.body.classList.remove("editing");
     toggle.checked = true;
     setCanGoBack(false);
@@ -2599,11 +3615,22 @@ const APP_HTML_TEMPLATE: &str = r#"<!doctype html>
   </script>
 </body>
 </html>
-"#;
+"###;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use tao::platform::windows::EventLoopBuilderExtWindows;
+
+    fn test_image_cache() -> ImageCache {
+        let mut builder = EventLoopBuilder::<AppEvent>::with_user_event();
+        #[cfg(windows)]
+        builder.with_any_thread(true);
+        let event_loop = builder.build();
+        let proxy = event_loop.create_proxy();
+        ImageCache::new(proxy).expect("image cache should initialize")
+    }
 
     #[test]
     fn renderer_adds_stable_heading_markers() {
@@ -2624,8 +3651,14 @@ mod tests {
 
     #[test]
     fn app_html_includes_theme_and_control_data() {
-        let html =
-            build_app_html("# One", &AppSettings::default()).expect("app html should render");
+        let mut image_cache = test_image_cache();
+        let html = build_app_html(
+            "# One",
+            Path::new("C:/Docs/source.md"),
+            &AppSettings::default(),
+            &mut image_cache,
+        )
+        .expect("app html should render");
 
         assert!(!html.contains("__THEMES__"));
         assert!(!html.contains("__SETTINGS__"));
@@ -2639,9 +3672,11 @@ mod tests {
         assert!(html.contains("Save (Ctrl+S)"));
         assert!(html.contains("settings-button"));
         assert!(html.contains("format-toolbar"));
+        assert!(html.contains("table-button"));
         assert!(html.contains(r#"grid-template-rows: 34px minmax(0, 1fr)"#));
         assert!(html.contains("contenteditable=\"true\""));
         assert!(html.contains(r#""themeId":"clean""#));
+        assert!(html.contains(r#""allowRemoteImages":false"#));
         assert!(html.contains(r#"kind: "saveSettings""#));
         assert!(html.contains("Plaintext: Alt+Left. Formatted: Alt+Right."));
         assert!(html.contains("showPlaintextView"));
@@ -2651,6 +3686,10 @@ mod tests {
         assert!(html.contains("__mdReaderCustomCssPicked"));
         assert!(html.contains("allowed-launch-extensions"));
         assert!(html.contains("allowedLaunchExtensions"));
+        assert!(html.contains("allowed-extensions-help"));
+        assert!(html.contains("Allowed by default: links with no extension"));
+        assert!(html.contains("allow-remote-images"));
+        assert!(html.contains("allowRemoteImages"));
         assert!(html.contains("link-click-behavior"));
         assert!(html.contains("linkClickBehavior"));
         assert!(html.contains("#rendered a"));
@@ -2660,14 +3699,23 @@ mod tests {
         assert!(html.contains("contextmenu"));
         assert!(html.contains("openLink"));
         assert!(html.contains("__mdReaderOpenLinkFailed"));
+        assert!(html.contains("tableHtml"));
+        assert!(html.contains("taskListPrefix"));
+        assert!(html.contains("mathMarkdown"));
         assert!(!html.contains("type=\"file\""));
         assert!(!html.contains("localStorage"));
     }
 
     #[test]
     fn app_html_requires_explicit_save() {
-        let html = build_app_html("[toc]\n\n# One", &AppSettings::default())
-            .expect("app html should render");
+        let mut image_cache = test_image_cache();
+        let html = build_app_html(
+            "[toc]\n\n# One",
+            Path::new("C:/Docs/source.md"),
+            &AppSettings::default(),
+            &mut image_cache,
+        )
+        .expect("app html should render");
 
         assert!(html.contains("__mdReaderRequestClose"));
         assert!(html.contains("Close without saving changes?"));
@@ -2707,6 +3755,109 @@ mod tests {
     }
 
     #[test]
+    fn renderer_resolves_local_images_against_document_parent() {
+        let root =
+            env::temp_dir().join(format!("markdown-reader-image-test-{}", std::process::id()));
+        let image_dir = root.join("images");
+        fs::create_dir_all(&image_dir).expect("image test dir should be created");
+        let image_path = image_dir.join("pic.png");
+        fs::write(&image_path, b"not checked for local image magic")
+            .expect("image fixture should be written");
+        let document_path = root.join("source.md");
+        let mut image_cache = test_image_cache();
+        let html = render_markdown_for_document(
+            "![Diagram](images/pic.png \"Flow\")",
+            &document_path,
+            &AppSettings::default(),
+            &mut image_cache,
+        );
+        let expected_url = file_url_from_path(&image_path).expect("image file URL should build");
+
+        assert!(html.contains(&format!(r#"src="{expected_url}""#)));
+        assert!(html.contains(r#"data-md-src="images/pic.png""#));
+        assert!(html.contains(r#"data-md-title="Flow""#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renderer_does_not_fetch_remote_images_when_disabled() {
+        let mut image_cache = test_image_cache();
+        let html = render_markdown_for_document(
+            "![Remote](https://example.com/pic.png)",
+            Path::new("C:/Docs/source.md"),
+            &AppSettings::default(),
+            &mut image_cache,
+        );
+
+        assert!(html.contains(r#"data-md-src="https://example.com/pic.png""#));
+        assert!(html.contains("blocked-image.gif"));
+        assert!(!html.contains(r#"<img src="https://"#));
+    }
+
+    #[test]
+    fn remote_image_url_validation_blocks_risky_hosts_and_schemes() {
+        assert!(validate_remote_image_url("https://example.com/pic.png").is_ok());
+        assert!(validate_remote_image_url("http://example.com/pic.png").is_err());
+        assert!(validate_remote_image_url("https://user:secret@example.com/pic.png").is_err());
+        assert!(validate_remote_image_url("https://localhost/pic.png").is_err());
+        assert!(validate_remote_image_url("https://127.0.0.1/pic.png").is_err());
+        assert!(validate_remote_image_url("https://10.0.0.4/pic.png").is_err());
+        assert!(validate_remote_image_url("https://[::ffff:127.0.0.1]/pic.png").is_err());
+        assert!(validate_remote_image_url("//example.com/pic.png").is_err());
+    }
+
+    #[test]
+    fn image_type_detection_allows_only_default_raster_formats() {
+        assert_eq!(
+            image_extension_from_content_type("image/png"),
+            Some("png".to_string())
+        );
+        assert_eq!(
+            image_extension_from_magic(b"\x89PNG\r\n\x1A\nabc"),
+            Some("png".to_string())
+        );
+        assert_eq!(
+            image_extension_from_magic(&[0xFF, 0xD8, 0xFF, 0x00]),
+            Some("jpg".to_string())
+        );
+        assert_eq!(
+            image_extension_from_magic(b"GIF89aabc"),
+            Some("gif".to_string())
+        );
+        assert_eq!(
+            image_extension_from_magic(b"BMabc"),
+            Some("bmp".to_string())
+        );
+        assert_eq!(
+            image_extension_from_magic(b"RIFFxxxxWEBPabc"),
+            Some("webp".to_string())
+        );
+        assert_eq!(image_extension_from_content_type("image/svg+xml"), None);
+        assert_eq!(normalize_image_extension("svg"), None);
+        assert_eq!(normalize_image_extension("ico"), None);
+    }
+
+    #[test]
+    fn renderer_preserves_supported_markdown_extras() {
+        let html = render_markdown_safely(
+            "- [x] Done\n- [ ] Todo\n\n~~gone~~\n\nTerm\n: Definition\n\n~subscript~ and ^superscript^ and $a+b$\n\nFootnote[^note]\n\n[^note]: Body",
+        );
+
+        assert!(html.contains(r#"type="checkbox""#));
+        assert!(html.contains(r#"checked=""#));
+        assert!(html.contains("<del>gone</del>"));
+        assert!(html.contains("<dl>"));
+        assert!(html.contains("<dt>Term</dt>"));
+        assert!(html.contains("<dd>Definition</dd>"));
+        assert!(html.contains("<sub>subscript</sub>"));
+        assert!(html.contains("<sup>superscript</sup>"));
+        assert!(html.contains(r#"class="math math-inline""#));
+        assert!(html.contains(r#"class="footnote-reference""#));
+        assert!(html.contains(r#"class="footnote-definition""#));
+    }
+
+    #[test]
     fn formatted_serializer_no_longer_uses_global_inline_escaping() {
         assert!(APP_HTML_TEMPLATE.contains("function protectParagraphMarkdown"));
         assert!(!APP_HTML_TEMPLATE.contains(r#"replace(/[\\`*_{}\[\]<>]/g"#));
@@ -2719,12 +3870,14 @@ mod tests {
             custom_css: String::new(),
             allowed_launch_extensions: Vec::new(),
             link_click_behavior: "missing".to_string(),
+            allow_remote_images: true,
         });
 
         assert_eq!(settings.theme_id, "clean");
         assert!(settings.custom_css.is_empty());
         assert!(settings.allowed_launch_extensions.is_empty());
         assert_eq!(settings.link_click_behavior, LINK_BEHAVIOR_NEW_WINDOW);
+        assert!(settings.allow_remote_images);
     }
 
     #[test]
@@ -2734,12 +3887,14 @@ mod tests {
             custom_css: String::new(),
             allowed_launch_extensions: Vec::new(),
             link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
+            allow_remote_images: false,
         });
         let with_css = normalize_settings(&AppSettings {
             theme_id: "custom".to_string(),
             custom_css: "body { color: #123; }".to_string(),
             allowed_launch_extensions: Vec::new(),
             link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
+            allow_remote_images: false,
         });
 
         assert_eq!(without_css.theme_id, "clean");
@@ -2755,6 +3910,7 @@ mod tests {
                 .to_string(),
             allowed_launch_extensions: Vec::new(),
             link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
+            allow_remote_images: false,
         });
 
         assert_eq!(settings.theme_id, "custom");
@@ -2773,6 +3929,7 @@ mod tests {
                 ".cmd".to_string(),
             ],
             link_click_behavior: LINK_BEHAVIOR_NAVIGATE.to_string(),
+            allow_remote_images: false,
         });
 
         assert_eq!(
@@ -2789,6 +3946,7 @@ mod tests {
             custom_css: String::new(),
             allowed_launch_extensions: Vec::new(),
             link_click_behavior: "sideways".to_string(),
+            allow_remote_images: false,
         });
 
         assert_eq!(settings.link_click_behavior, LINK_BEHAVIOR_NEW_WINDOW);
@@ -2851,6 +4009,7 @@ mod tests {
             custom_css: String::new(),
             allowed_launch_extensions: vec!["exe".to_string(), "ps1".to_string()],
             link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
+            allow_remote_images: false,
         };
 
         assert_eq!(
