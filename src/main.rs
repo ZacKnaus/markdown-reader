@@ -353,6 +353,7 @@ enum IpcMessage {
     },
     PickCustomCss,
     PickImage {
+        #[serde(rename = "embedBase64")]
         embed_base64: bool,
     },
     OpenLink {
@@ -4252,6 +4253,18 @@ mod tests {
 
         assert!(!html.to_lowercase().contains("<script"));
         assert!(!html.contains("alert"));
+    }
+
+    #[test]
+    fn image_picker_ipc_accepts_button_payload() {
+        let message: IpcMessage =
+            serde_json::from_str(r#"{"kind":"pickImage","embedBase64":true}"#)
+                .expect("choose-image button payload should deserialize");
+
+        match message {
+            IpcMessage::PickImage { embed_base64 } => assert!(embed_base64),
+            other => panic!("expected PickImage message, got {other:?}"),
+        }
     }
 
     #[test]
