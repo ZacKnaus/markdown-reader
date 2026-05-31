@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use pulldown_cmark::{html, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{html, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use tao::{
@@ -2498,6 +2498,34 @@ fn render_markdown_internal(
             Event::End(TagEnd::Heading(level)) => {
                 indexed_events.push(Event::Html(format!("</{}>", heading_tag(level)).into()));
             }
+            Event::Start(tag @ Tag::Link { .. }) => {
+                if let Some(context) = image_context.as_ref() {
+                    if matches!(
+                        context.mode,
+                        ImageRenderMode::ExportOriginal | ImageRenderMode::ExportSelfContained
+                    ) {
+                        if let Tag::Link {
+                            link_type,
+                            dest_url,
+                            title,
+                            ..
+                        } = &tag
+                        {
+                            indexed_events.push(Event::Html(
+                                markdown_link_start_html(
+                                    dest_url.as_ref(),
+                                    title.as_ref(),
+                                    *link_type,
+                                    context,
+                                )
+                                .into(),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                indexed_events.push(Event::Start(tag));
+            }
             Event::Start(Tag::Image {
                 dest_url, title, ..
             }) => {
@@ -2730,6 +2758,48 @@ fn css_image_dimension(value: &str) -> String {
     }
 }
 
+fn markdown_link_start_html(
+    original_href: &str,
+    title: &str,
+    link_type: LinkType,
+    context: &ImageRewriteContext<'_>,
+) -> String {
+    let href = resolve_export_link_href(context.document_path, original_href, link_type)
+        .unwrap_or_else(|_| original_href.to_string());
+    let title_attr = if title.is_empty() {
+        String::new()
+    } else {
+        format!(r#" title="{}""#, escape_html_attribute(title))
+    };
+
+    format!(r#"<a href="{}"{title_attr}>"#, escape_html_attribute(&href))
+}
+
+fn resolve_export_link_href(
+    document_path: &Path,
+    original_href: &str,
+    link_type: LinkType,
+) -> Result<String> {
+    let trimmed = original_href.trim();
+    if trimmed.is_empty() {
+        bail!("link target is empty");
+    }
+    if trimmed.starts_with('#') {
+        return Ok(trimmed.to_string());
+    }
+    if link_type == LinkType::Email {
+        return Ok(format!("mailto:{trimmed}"));
+    }
+    if let Some(scheme) = href_scheme(trimmed) {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "file" | "http" | "https" | "mailto" => Ok(trimmed.to_string()),
+            _ => bail!("blocked unsupported export link scheme: {scheme}"),
+        };
+    }
+
+    local_reference_file_url(document_path, trimmed)
+}
+
 fn resolve_markdown_image_src(
     context: &mut ImageRewriteContext<'_>,
     original_src: &str,
@@ -2741,7 +2811,9 @@ fn resolve_markdown_image_src(
 
     match context.mode {
         ImageRenderMode::AppView => {}
-        ImageRenderMode::ExportOriginal => return resolve_export_original_image_src(trimmed),
+        ImageRenderMode::ExportOriginal => {
+            return resolve_export_original_image_src(context.document_path, trimmed)
+        }
         ImageRenderMode::ExportSelfContained => {
             return resolve_export_self_contained_image_src(context.document_path, trimmed)
         }
@@ -2789,7 +2861,7 @@ fn resolve_markdown_image_src(
     image_data_uri_from_path(&resolved)
 }
 
-fn resolve_export_original_image_src(original_src: &str) -> Result<String> {
+fn resolve_export_original_image_src(document_path: &Path, original_src: &str) -> Result<String> {
     let trimmed = original_src.trim();
     if trimmed.is_empty() {
         bail!("image source is empty");
@@ -2808,7 +2880,7 @@ fn resolve_export_original_image_src(original_src: &str) -> Result<String> {
             _ => bail!("blocked unsupported image scheme: {scheme}"),
         };
     }
-    Ok(trimmed.to_string())
+    local_reference_file_url(document_path, trimmed)
 }
 
 fn resolve_export_self_contained_image_src(
@@ -2835,6 +2907,39 @@ fn resolve_export_self_contained_image_src(
     let path = resolve_local_image_source_path(document_path, trimmed)?;
     ensure_image_path_is_renderable(&path)?;
     image_data_uri_from_path(&path)
+}
+
+fn local_reference_file_url(document_path: &Path, reference: &str) -> Result<String> {
+    let trimmed = reference.trim();
+    let path_part = strip_link_fragment_and_query(trimmed);
+    let suffix = &trimmed[path_part.len()..];
+    let decoded = percent_decode_path(path_part)?;
+    if decoded.trim().is_empty() {
+        bail!("reference does not include a path");
+    }
+    let linked_path = PathBuf::from(decoded);
+    let resolved = if linked_path.is_absolute() {
+        linked_path
+    } else {
+        document_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(linked_path)
+    };
+    Ok(format!("{}{}", path_to_file_url(&resolved)?, suffix))
+}
+
+fn path_to_file_url(path: &Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to resolve current directory for file URL")?
+            .join(path)
+    };
+    Url::from_file_path(&absolute)
+        .map(|url| url.to_string())
+        .map_err(|_| anyhow::anyhow!("failed to convert {} to a file URL", absolute.display()))
 }
 
 fn escape_html_attribute(value: &str) -> String {
@@ -5791,20 +5896,49 @@ mod tests {
             allow_remote_images: false,
         };
         let html = standalone_html_document(
-            "![Diagram](images/pic.png \"Flow\"){width=320}\n\nAfter",
+            "![Diagram](images/pic.png \"Flow\"){width=320}\n\n[Guide](references/guide.md#top)\n\n[Local](#local-anchor)\n\nAfter",
             Path::new("C:/Docs/source.md"),
             &settings,
             ImageRenderMode::ExportOriginal,
+        );
+        let expected_image_src = path_to_file_url(Path::new("C:/Docs/images/pic.png"))
+            .expect("expected image file URL should build");
+        let expected_link_href = format!(
+            "{}#top",
+            path_to_file_url(Path::new("C:/Docs/references/guide.md"))
+                .expect("expected link file URL should build")
         );
 
         assert!(html.contains("<style>"));
         assert!(html.contains("--accent: #1f7a68"));
         assert!(html.contains("#rendered { color: #123456; }"));
-        assert!(html.contains(r#"src="images/pic.png""#));
+        assert!(html.contains(&format!(r#"src="{expected_image_src}""#)));
+        assert!(!html.contains(r#"<img src="images/pic.png""#));
         assert!(html.contains(r#"data-md-src="images/pic.png""#));
+        assert!(html.contains(&format!(r#"href="{expected_link_href}""#)));
+        assert!(!html.contains(r#"href="references/guide.md#top""#));
+        assert!(html.contains(r##"href="#local-anchor""##));
         assert!(html.contains(r#"data-md-title="Flow""#));
         assert!(html.contains(r#"style="width: 320px; height: auto;""#));
         assert!(html.contains(">After</p>"));
+    }
+
+    #[test]
+    fn html_export_resolves_relative_links_against_source_in_self_contained_mode() {
+        let html = standalone_html_document(
+            "[Guide](references/guide.md?draft=1#top)",
+            Path::new("C:/Docs/source.md"),
+            &AppSettings::default(),
+            ImageRenderMode::ExportSelfContained,
+        );
+        let expected_href = format!(
+            "{}?draft=1#top",
+            path_to_file_url(Path::new("C:/Docs/references/guide.md"))
+                .expect("expected link file URL should build")
+        );
+
+        assert!(html.contains(&format!(r#"href="{expected_href}""#)));
+        assert!(!html.contains(r#"href="references/guide.md?draft=1#top""#));
     }
 
     #[test]

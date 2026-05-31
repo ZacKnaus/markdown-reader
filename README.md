@@ -17,7 +17,7 @@ markdown-reader.exe --export-html path\to\file.md
 markdown-reader.exe --export-html --self-contained path\to\file.md path\to\file.html
 ```
 
-Default HTML export preserves the original image paths and URLs while embedding the active theme CSS. Self-contained export embeds supported local images as data URIs and keeps remote image URLs unchanged.
+Default HTML export embeds the active theme CSS and pins local relative links/images to file URLs based on the source Markdown folder, so exporting the HTML somewhere else does not break those references. Self-contained export embeds supported local images as data URIs and keeps remote image URLs unchanged.
 
 Windows builds use the GUI subsystem, so launching `markdown-reader.exe` opens the app window without a background console window.
 Markdown Reader requires the Microsoft Edge WebView2 Runtime. If it is missing, startup shows a friendly message with the official Microsoft WebView2 download link.
