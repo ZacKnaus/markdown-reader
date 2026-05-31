@@ -10,6 +10,10 @@ cargo run -- path\to\file.md
 
 The app expects UTF-8 Markdown. Passing zero arguments or an invalid argument combination exits with a usage error.
 
+## V1 Release
+
+The V1 Windows executable is published in `dist/v1.0.0/Markdown Reader.exe`, with its SHA-256 checksum in `dist/v1.0.0/SHA256SUMS.txt`. It is a no-installer portable app binary, but it still requires the Microsoft Edge WebView2 Runtime on the Windows machine that runs it.
+
 Export the formatted output to standalone HTML from the toolbar button beside Save, or right-click that button for a self-contained export. The same modes are available from the command line:
 
 ```powershell

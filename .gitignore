@@ -6,3 +6,6 @@
 
 # Rust build output
 target/
+
+# Local manual smoke-test scratch files
+testing/
