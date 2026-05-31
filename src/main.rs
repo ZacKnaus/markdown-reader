@@ -6,6 +6,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::Read,
+    iter::Peekable,
     net::{IpAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -389,6 +390,12 @@ struct ImagePickResult {
     preview_src: String,
     alt: String,
     embedded: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ImageSizeAttributes {
+    width: Option<String>,
+    height: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -1862,7 +1869,7 @@ fn render_markdown_internal(
     options.insert(Options::ENABLE_SUPERSCRIPT);
     options.insert(Options::ENABLE_MATH);
 
-    let mut parser = Parser::new_ext(&markdown, options);
+    let mut parser = Parser::new_ext(&markdown, options).peekable();
     let mut next_heading_index = 0usize;
     let mut indexed_events = Vec::new();
 
@@ -1890,15 +1897,20 @@ fn render_markdown_internal(
                 dest_url, title, ..
             }) => {
                 let alt = collect_image_alt_text(&mut parser);
+                let (image_size, remainder) = consume_image_size_attributes(&mut parser);
                 indexed_events.push(Event::Html(
                     markdown_image_html(
                         dest_url.as_ref(),
                         title.as_ref(),
                         &alt,
+                        &image_size,
                         image_context.as_mut(),
                     )
                     .into(),
                 ));
+                if let Some(remainder) = remainder {
+                    indexed_events.push(Event::Text(remainder.into()));
+                }
             }
             Event::End(TagEnd::Image) => {}
             other => indexed_events.push(other),
@@ -1910,7 +1922,7 @@ fn render_markdown_internal(
     sanitize_rendered_html(&unsafe_html)
 }
 
-fn collect_image_alt_text<'a>(parser: &mut Parser<'a>) -> String {
+fn collect_image_alt_text<'a>(parser: &mut Peekable<Parser<'a>>) -> String {
     let mut alt = String::new();
     let mut depth = 1usize;
 
@@ -1934,10 +1946,103 @@ fn collect_image_alt_text<'a>(parser: &mut Parser<'a>) -> String {
     alt
 }
 
+fn consume_image_size_attributes<'a>(
+    parser: &mut Peekable<Parser<'a>>,
+) -> (ImageSizeAttributes, Option<String>) {
+    let Some((attributes, remainder)) = parser.peek().and_then(|event| match event {
+        Event::Text(text) => parse_image_size_attribute_suffix(text.as_ref())
+            .map(|(attributes, remainder)| (attributes, remainder.to_string())),
+        _ => None,
+    }) else {
+        return (ImageSizeAttributes::default(), None);
+    };
+
+    parser.next();
+    let remainder = if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder.to_string())
+    };
+    (attributes, remainder)
+}
+
+fn parse_image_size_attribute_suffix(text: &str) -> Option<(ImageSizeAttributes, &str)> {
+    let inner = text.strip_prefix('{')?;
+    let end = inner.find('}')?;
+    let attributes = parse_image_size_attributes(&inner[..end])?;
+    Some((attributes, &inner[end + 1..]))
+}
+
+fn parse_image_size_attributes(value: &str) -> Option<ImageSizeAttributes> {
+    let mut attributes = ImageSizeAttributes::default();
+
+    for token in value.split_ascii_whitespace() {
+        let Some((key, raw_value)) = token.split_once('=') else {
+            continue;
+        };
+        let Some(dimension) = normalize_image_dimension(raw_value) else {
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "width" | "w" => attributes.width = Some(dimension),
+            "height" | "h" => attributes.height = Some(dimension),
+            _ => {}
+        }
+    }
+
+    if attributes.width.is_some() || attributes.height.is_some() {
+        Some(attributes)
+    } else {
+        None
+    }
+}
+
+fn normalize_image_dimension(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(percent) = value.strip_suffix('%') {
+        if is_positive_decimal(percent) {
+            return Some(format!("{percent}%"));
+        }
+        return None;
+    }
+
+    let pixels = value.strip_suffix("px").unwrap_or(&value);
+    if pixels.chars().all(|ch| ch.is_ascii_digit()) {
+        let parsed = pixels.parse::<u32>().ok()?;
+        if (1..=10000).contains(&parsed) {
+            return Some(parsed.to_string());
+        }
+    }
+
+    None
+}
+
+fn is_positive_decimal(value: &str) -> bool {
+    if value.is_empty() || value.matches('.').count() > 1 {
+        return false;
+    }
+    if !value.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
+        return false;
+    }
+    value
+        .parse::<f64>()
+        .is_ok_and(|parsed| parsed > 0.0 && parsed <= 1000.0)
+}
+
 fn markdown_image_html(
     original_src: &str,
     title: &str,
     alt: &str,
+    image_size: &ImageSizeAttributes,
     image_context: Option<&mut ImageRewriteContext<'_>>,
 ) -> String {
     let resolved_src =
@@ -1964,9 +2069,19 @@ fn markdown_image_html(
             escape_html_attribute(title)
         )
     };
+    let width_attr = image_size
+        .width
+        .as_deref()
+        .map(|width| format!(r#" data-md-width="{}""#, escape_html_attribute(width)))
+        .unwrap_or_default();
+    let height_attr = image_size
+        .height
+        .as_deref()
+        .map(|height| format!(r#" data-md-height="{}""#, escape_html_attribute(height)))
+        .unwrap_or_default();
 
     format!(
-        r#"<img{src_attr} alt="{}" data-md-src="{}"{title_attr} />"#,
+        r#"<img{src_attr} alt="{}" data-md-src="{}"{title_attr}{width_attr}{height_attr} />"#,
         escape_html_attribute(alt),
         escape_html_attribute(original_src)
     )
@@ -2038,7 +2153,15 @@ fn sanitize_rendered_html(unsafe_html: &str) -> String {
     builder.add_tags(&["input"]);
     builder.add_tag_attributes("input", &["type", "checked", "disabled"]);
     builder.set_tag_attribute_value("input", "disabled", "");
-    builder.add_tag_attributes("img", &["data-md-src", "data-md-title"]);
+    builder.add_tag_attributes(
+        "img",
+        &[
+            "data-md-src",
+            "data-md-title",
+            "data-md-width",
+            "data-md-height",
+        ],
+    );
     builder.add_tag_attributes("div", &["class"]);
     builder.add_tag_attributes("span", &["class"]);
     builder.add_tag_attributes("sup", &["class"]);
@@ -2048,6 +2171,9 @@ fn sanitize_rendered_html(unsafe_html: &str) -> String {
     builder.attribute_filter(|element, attribute, value| match (element, attribute) {
         ("img", "src") if is_safe_rendered_image_src(value) => Some(value.into()),
         ("img", "src") => None,
+        ("img", "data-md-width" | "data-md-height") => {
+            normalize_image_dimension(value).map(Into::into)
+        }
         ("input", "type") if value.eq_ignore_ascii_case("checkbox") => Some("checkbox".into()),
         ("input", "checked" | "disabled") => Some(String::new().into()),
         ("input", _) => None,
@@ -2454,6 +2580,98 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     #rendered img {
       max-width: 100%;
       height: auto;
+      cursor: default;
+      vertical-align: middle;
+    }
+
+    #rendered img.md-image-selected {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    #image-resize-overlay[hidden] {
+      display: none;
+    }
+
+    #image-resize-overlay {
+      position: fixed;
+      z-index: 20;
+      border: 1px solid var(--accent);
+      box-sizing: border-box;
+      pointer-events: none;
+    }
+
+    .image-resize-handle {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      background: #fff;
+      border: 2px solid var(--accent);
+      border-radius: 2px;
+      box-sizing: border-box;
+      pointer-events: auto;
+    }
+
+    .image-resize-handle[data-handle="nw"] {
+      left: -6px;
+      top: -6px;
+      cursor: nwse-resize;
+    }
+
+    .image-resize-handle[data-handle="n"] {
+      left: calc(50% - 5px);
+      top: -6px;
+      cursor: ns-resize;
+    }
+
+    .image-resize-handle[data-handle="ne"] {
+      right: -6px;
+      top: -6px;
+      cursor: nesw-resize;
+    }
+
+    .image-resize-handle[data-handle="e"] {
+      right: -6px;
+      top: calc(50% - 5px);
+      cursor: ew-resize;
+    }
+
+    .image-resize-handle[data-handle="se"] {
+      right: -6px;
+      bottom: -6px;
+      cursor: nwse-resize;
+    }
+
+    .image-resize-handle[data-handle="s"] {
+      left: calc(50% - 5px);
+      bottom: -6px;
+      cursor: ns-resize;
+    }
+
+    .image-resize-handle[data-handle="sw"] {
+      left: -6px;
+      bottom: -6px;
+      cursor: nesw-resize;
+    }
+
+    .image-resize-handle[data-handle="w"] {
+      left: -6px;
+      top: calc(50% - 5px);
+      cursor: ew-resize;
+    }
+
+    .image-resize-reset {
+      position: absolute;
+      right: -1px;
+      top: -34px;
+      min-height: 26px;
+      padding: 0 10px;
+      border: 1px solid var(--accent);
+      border-radius: 4px;
+      color: #fff;
+      background: var(--accent);
+      font: 12px/1 "Segoe UI", system-ui, sans-serif;
+      pointer-events: auto;
     }
 
     .modal-backdrop[hidden] {
@@ -2849,6 +3067,17 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
   <div id="link-menu" class="link-menu" hidden>
     <button id="link-menu-action" type="button"></button>
   </div>
+  <div id="image-resize-overlay" hidden>
+    <button id="image-resize-reset" class="image-resize-reset" type="button">Reset</button>
+    <span class="image-resize-handle" data-handle="nw" title="Resize image"></span>
+    <span class="image-resize-handle" data-handle="n" title="Resize image"></span>
+    <span class="image-resize-handle" data-handle="ne" title="Resize image"></span>
+    <span class="image-resize-handle" data-handle="e" title="Resize image"></span>
+    <span class="image-resize-handle" data-handle="se" title="Resize image"></span>
+    <span class="image-resize-handle" data-handle="s" title="Resize image"></span>
+    <span class="image-resize-handle" data-handle="sw" title="Resize image"></span>
+    <span class="image-resize-handle" data-handle="w" title="Resize image"></span>
+  </div>
   <script>
     const initialMarkdown = __INITIAL_MARKDOWN__;
     const initialRendered = __INITIAL_RENDERED__;
@@ -2878,6 +3107,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	    const allowedExtensionsHelpText = document.getElementById("allowed-extensions-help-text");
     const linkMenu = document.getElementById("link-menu");
     const linkMenuAction = document.getElementById("link-menu-action");
+    const imageResizeOverlay = document.getElementById("image-resize-overlay");
+    const imageResizeReset = document.getElementById("image-resize-reset");
     const themeStyle = document.getElementById("theme-style");
     const customThemeStyle = document.getElementById("custom-theme-style");
     const blockFormat = document.getElementById("block-format");
@@ -2892,6 +3123,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	    const footnoteButton = document.getElementById("footnote-button");
     let dirty = false;
     let renderedDirty = false;
+    let selectedImage = null;
+    let imageResizeDrag = null;
 	    let customCss = sanitizeCustomCss(initialSettings.customCss || "");
 	    let allowedLaunchExtensions = sanitizeAllowedLaunchExtensions(initialSettings.allowedLaunchExtensions || []);
 	    let linkClickBehavior = normalizeLinkClickBehavior(initialSettings.linkClickBehavior);
@@ -2903,6 +3136,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 
     editor.value = initialMarkdown;
     rendered.innerHTML = initialRendered;
+    applyImageSizes(rendered);
 	    allowedLaunchExtensionsInput.value = formatAllowedLaunchExtensions(allowedLaunchExtensions);
 	    linkClickBehaviorSelect.value = linkClickBehavior;
 	    allowRemoteImagesInput.checked = allowRemoteImages;
@@ -2915,6 +3149,169 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       dirty = value;
       saveButton.classList.toggle("dirty", dirty);
       saveButton.classList.toggle("saved", !dirty);
+    }
+
+    function applyImageSizes(root) {
+      for (const image of root.querySelectorAll("img")) {
+        applyImageSize(image);
+      }
+    }
+
+    function applyImageSize(image) {
+      const width = normalizeImageDimension(image.dataset.mdWidth || image.getAttribute("width") || "");
+      const height = normalizeImageDimension(image.dataset.mdHeight || image.getAttribute("height") || "");
+      if (width) {
+        image.dataset.mdWidth = width;
+        image.style.width = cssImageDimension(width);
+      } else {
+        delete image.dataset.mdWidth;
+        image.style.removeProperty("width");
+      }
+      if (height) {
+        image.dataset.mdHeight = height;
+        image.style.height = cssImageDimension(height);
+      } else {
+        delete image.dataset.mdHeight;
+        image.style.height = width ? "auto" : "";
+      }
+    }
+
+    function normalizeImageDimension(value) {
+      const dimension = String(value || "").trim().replace(/^['"]|['"]$/g, "").trim().toLowerCase();
+      if (!dimension) {
+        return "";
+      }
+      if (/^\d+(?:\.\d+)?%$/.test(dimension)) {
+        const number = Number.parseFloat(dimension);
+        return number > 0 && number <= 1000 ? dimension : "";
+      }
+      const pixels = dimension.endsWith("px") ? dimension.slice(0, -2) : dimension;
+      if (/^\d+$/.test(pixels)) {
+        const parsed = Number.parseInt(pixels, 10);
+        return parsed > 0 && parsed <= 10000 ? String(parsed) : "";
+      }
+      return "";
+    }
+
+    function cssImageDimension(value) {
+      return String(value).endsWith("%") ? String(value) : `${value}px`;
+    }
+
+    function imageSizeMarkdown(image) {
+      const width = normalizeImageDimension(image.dataset.mdWidth || "");
+      const height = normalizeImageDimension(image.dataset.mdHeight || "");
+      const parts = [];
+      if (width) {
+        parts.push(`width=${width}`);
+      }
+      if (height) {
+        parts.push(`height=${height}`);
+      }
+      return parts.length ? `{${parts.join(" ")}}` : "";
+    }
+
+    function selectImage(image) {
+      if (selectedImage && selectedImage !== image) {
+        selectedImage.classList.remove("md-image-selected");
+      }
+      selectedImage = image;
+      selectedImage.classList.add("md-image-selected");
+      imageResizeOverlay.hidden = false;
+      updateImageResizeOverlay();
+    }
+
+    function clearImageSelection() {
+      if (imageResizeDrag) {
+        return;
+      }
+      if (selectedImage) {
+        selectedImage.classList.remove("md-image-selected");
+      }
+      selectedImage = null;
+      imageResizeOverlay.hidden = true;
+    }
+
+    function updateImageResizeOverlay() {
+      if (!selectedImage || imageResizeOverlay.hidden || !document.body.contains(selectedImage)) {
+        imageResizeOverlay.hidden = true;
+        return;
+      }
+      const rect = selectedImage.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        imageResizeOverlay.hidden = true;
+        return;
+      }
+      imageResizeOverlay.style.left = `${rect.left}px`;
+      imageResizeOverlay.style.top = `${rect.top}px`;
+      imageResizeOverlay.style.width = `${rect.width}px`;
+      imageResizeOverlay.style.height = `${rect.height}px`;
+    }
+
+    function startImageResize(event) {
+      if (!selectedImage) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = selectedImage.getBoundingClientRect();
+      imageResizeDrag = {
+        handle: event.currentTarget.dataset.handle || "se",
+        startX: event.clientX,
+        startY: event.clientY,
+        startWidth: Math.max(1, rect.width),
+        startHeight: Math.max(1, rect.height),
+        aspectRatio: Math.max(1, rect.width) / Math.max(1, rect.height)
+      };
+      window.addEventListener("mousemove", resizeSelectedImage);
+      window.addEventListener("mouseup", finishImageResize, { once: true });
+    }
+
+    function resizeSelectedImage(event) {
+      if (!imageResizeDrag || !selectedImage) {
+        return;
+      }
+      const drag = imageResizeDrag;
+      const horizontal = drag.handle.includes("e")
+        ? event.clientX - drag.startX
+        : drag.handle.includes("w")
+          ? drag.startX - event.clientX
+          : 0;
+      const vertical = drag.handle.includes("s")
+        ? event.clientY - drag.startY
+        : drag.handle.includes("n")
+          ? drag.startY - event.clientY
+          : 0;
+      let width = drag.startWidth + horizontal;
+      if (!horizontal && vertical) {
+        width = drag.startWidth + vertical * drag.aspectRatio;
+      }
+      width = Math.max(24, Math.min(Math.round(width), Math.max(24, rendered.clientWidth - 16)));
+      selectedImage.dataset.mdWidth = String(width);
+      selectedImage.style.width = `${width}px`;
+      selectedImage.style.height = "auto";
+      delete selectedImage.dataset.mdHeight;
+      renderedDirty = true;
+      setDirty(true);
+      updateImageResizeOverlay();
+    }
+
+    function finishImageResize() {
+      window.removeEventListener("mousemove", resizeSelectedImage);
+      imageResizeDrag = null;
+      updateImageResizeOverlay();
+    }
+
+    function resetSelectedImageSize() {
+      if (!selectedImage) {
+        return;
+      }
+      delete selectedImage.dataset.mdWidth;
+      delete selectedImage.dataset.mdHeight;
+      selectedImage.style.removeProperty("width");
+      selectedImage.style.removeProperty("height");
+      renderedDirty = true;
+      setDirty(true);
+      updateImageResizeOverlay();
     }
 
     function setCanGoBack(value) {
@@ -3071,6 +3468,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 
     function switchToEditor() {
       const marker = markerFromRendered();
+      clearImageSelection();
       commitRenderedEditsToMarkdown();
       document.body.classList.add("editing");
       toggle.checked = false;
@@ -3210,7 +3608,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	        const alt = normalizeText(node.getAttribute("alt") || "");
 	        const src = node.getAttribute("data-md-src") || node.getAttribute("src") || "";
 	        const title = node.getAttribute("data-md-title") || node.getAttribute("title") || "";
-	        return src ? `![${alt}](${markdownDestination(src)}${title ? ` "${markdownTitle(title)}"` : ""})` : alt;
+	        return src ? `![${alt}](${markdownDestination(src)}${title ? ` "${markdownTitle(title)}"` : ""})${imageSizeMarkdown(node)}` : alt;
 	      }
       if (tag === "br") {
         return "\n";
@@ -3663,6 +4061,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
             <button id="insert-image-browse" class="settings-button" type="button">Choose image...</button>
             <label class="field" for="insert-image-alt">Alt text<input id="insert-image-alt" name="alt" type="text" autocomplete="off" value="${escapeAttribute(selectedText)}"></label>
             <label class="field" for="insert-image-title">Title<input id="insert-image-title" name="title" type="text" autocomplete="off"></label>
+            <label class="field" for="insert-image-width">Width<input id="insert-image-width" name="width" type="text" autocomplete="off" placeholder="640 or 50%"></label>
           `
         },
         table: {
@@ -3802,7 +4201,9 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       const alt = formValue("alt");
       const title = formValue("title");
       const previewSrc = formValue("previewSrc") || source;
-      insertHtmlAtSelection(`<img src="${escapeAttribute(previewSrc)}" alt="${escapeAttribute(alt)}" data-md-src="${escapeAttribute(source)}"${title ? ` title="${escapeAttribute(title)}" data-md-title="${escapeAttribute(title)}"` : ""}>`);
+      const width = normalizeImageDimension(formValue("width"));
+      insertHtmlAtSelection(`<img src="${escapeAttribute(previewSrc)}" alt="${escapeAttribute(alt)}" data-md-src="${escapeAttribute(source)}"${title ? ` title="${escapeAttribute(title)}" data-md-title="${escapeAttribute(title)}"` : ""}${width ? ` data-md-width="${escapeAttribute(width)}"` : ""}>`);
+      applyImageSizes(rendered);
       closeInsertForm(false);
     }
 
@@ -3919,6 +4320,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       const previousMarkdown = editor.value;
       editor.value = expandedMarkdown;
       rendered.innerHTML = html;
+      applyImageSizes(rendered);
+      clearImageSelection();
       renderedDirty = false;
       if (expandedMarkdown !== previousMarkdown) {
         setDirty(true);
@@ -3932,6 +4335,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       hideLinkMenu();
       editor.value = expandedMarkdown;
       rendered.innerHTML = html;
+      applyImageSizes(rendered);
+      clearImageSelection();
       renderedDirty = false;
       document.body.classList.remove("editing");
       toggle.checked = true;
@@ -4129,6 +4534,10 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
         event.preventDefault();
         hideLinkMenu();
       }
+      if (event.key === "Escape" && selectedImage) {
+        event.preventDefault();
+        clearImageSelection();
+      }
       if (event.key === "Escape" && allowedExtensionsHelpButton.getAttribute("aria-expanded") === "true") {
         event.preventDefault();
         setAllowedExtensionsHelpVisible(false);
@@ -4137,6 +4546,13 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     });
 
     rendered.addEventListener("click", (event) => {
+      const image = event.target.closest("img");
+      if (image && rendered.contains(image)) {
+        event.preventDefault();
+        selectImage(image);
+        return;
+      }
+      clearImageSelection();
       const anchor = event.target.closest("a");
       if (anchor) {
         event.preventDefault();
@@ -4171,14 +4587,31 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       }
     });
 
+    imageResizeOverlay.querySelectorAll(".image-resize-handle").forEach((handle) => {
+      handle.addEventListener("mousedown", startImageResize);
+    });
+    imageResizeReset.addEventListener("click", (event) => {
+      event.preventDefault();
+      resetSelectedImageSize();
+    });
+
     document.addEventListener("click", (event) => {
       if (!linkMenu.hidden && !linkMenu.contains(event.target)) {
         hideLinkMenu();
       }
+      if (selectedImage && !imageResizeOverlay.contains(event.target) && event.target !== selectedImage) {
+        clearImageSelection();
+      }
     });
 
-    rendered.addEventListener("scroll", hideLinkMenu);
-    window.addEventListener("resize", hideLinkMenu);
+    rendered.addEventListener("scroll", () => {
+      hideLinkMenu();
+      updateImageResizeOverlay();
+    });
+    window.addEventListener("resize", () => {
+      hideLinkMenu();
+      updateImageResizeOverlay();
+    });
 
     populateThemes();
     const storedTheme = initialSettings.themeId || "clean";
@@ -4272,6 +4705,12 @@ mod tests {
         assert!(html.contains("code-block-button"));
         assert!(html.contains("math-button"));
         assert!(html.contains("image-button"));
+        assert!(html.contains("image-resize-overlay"));
+        assert!(html.contains("image-resize-handle"));
+        assert!(html.contains("startImageResize"));
+        assert!(html.contains("imageSizeMarkdown"));
+        assert!(html.contains("data-md-width"));
+        assert!(html.contains("insert-image-width"));
         assert!(html.contains("insert-image-browse"));
         assert!(html.contains("insert-image-embed"));
         assert!(html.contains("previewSrc"));
@@ -4399,6 +4838,45 @@ mod tests {
         assert!(html.contains(r#"data-md-title="Flow""#));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renderer_preserves_markdown_image_size_attributes() {
+        let root = env::temp_dir().join(format!(
+            "markdown-reader-image-size-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("image size test dir should be created");
+        let image_path = root.join("pic.png");
+        fs::write(&image_path, TRANSPARENT_GIF).expect("image fixture should be written");
+        let document_path = root.join("source.md");
+        let mut image_cache = test_image_cache();
+        let html = render_markdown_for_document(
+            "![Diagram](pic.png){width=320 height=240}\n\nAfter",
+            &document_path,
+            &AppSettings::default(),
+            &mut image_cache,
+        );
+
+        assert!(html.contains(r#"data-md-src="pic.png""#));
+        assert!(html.contains(r#"data-md-width="320""#));
+        assert!(html.contains(r#"data-md-height="240""#));
+        assert!(html.contains(">After</p>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn image_size_attributes_accept_percent_widths_and_reject_script_like_values() {
+        assert_eq!(
+            parse_image_size_attribute_suffix("{width=50%}").map(|(attrs, _)| attrs.width),
+            Some(Some("50%".to_string()))
+        );
+        assert_eq!(
+            parse_image_size_attribute_suffix("{width=320px height='240'}")
+                .map(|(attrs, _)| { (attrs.width, attrs.height) }),
+            Some((Some("320".to_string()), Some("240".to_string())))
+        );
+        assert!(parse_image_size_attribute_suffix("{width=expression(alert(1))}").is_none());
     }
 
     #[test]
