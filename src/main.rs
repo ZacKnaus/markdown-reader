@@ -296,11 +296,11 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                     }
                 }
             }
-            TaoEvent::UserEvent(AppEvent::RemoteImageReady { source, file_url }) => {
-                image_cache.mark_remote_file_url(&source, file_url.clone());
+            TaoEvent::UserEvent(AppEvent::RemoteImageReady { source, render_src }) => {
+                image_cache.mark_remote_render_src(&source, render_src.clone());
                 if current_settings.allow_remote_images {
                     if let Some(webview) = webview.as_ref() {
-                        notify_remote_image_ready(webview, &source, file_url.as_deref());
+                        notify_remote_image_ready(webview, &source, render_src.as_deref());
                     }
                 }
             }
@@ -333,7 +333,7 @@ enum AppEvent {
     GoBack,
     RemoteImageReady {
         source: String,
-        file_url: Option<String>,
+        render_src: Option<String>,
     },
 }
 
@@ -407,7 +407,7 @@ struct ImageCache {
     root: PathBuf,
     remote_urls: HashMap<String, RemoteImageState>,
     next_file_index: usize,
-    placeholder_file_url: Option<String>,
+    placeholder_render_src: Option<String>,
     proxy: EventLoopProxy<AppEvent>,
 }
 
@@ -419,12 +419,12 @@ impl ImageCache {
             root,
             remote_urls: HashMap::new(),
             next_file_index: 0,
-            placeholder_file_url: None,
+            placeholder_render_src: None,
             proxy,
         })
     }
 
-    fn remote_file_url(&mut self, image_url: &str) -> Result<String> {
+    fn remote_render_src(&mut self, image_url: &str) -> Result<String> {
         if image_url.len() > 4096 {
             bail!("remote image URL is too long");
         }
@@ -432,7 +432,7 @@ impl ImageCache {
         match self.remote_urls.get(&image_url) {
             Some(RemoteImageState::Ready(cached_url)) => return Ok(cached_url.clone()),
             Some(RemoteImageState::Pending | RemoteImageState::Failed) => {
-                return self.placeholder_file_url();
+                return self.placeholder_render_src();
             }
             None => {}
         }
@@ -448,32 +448,29 @@ impl ImageCache {
         let proxy = self.proxy.clone();
         let source = image_url.clone();
         std::thread::spawn(move || {
-            let file_url = fetch_remote_image_to_cache(&source, &root, file_index).ok();
-            let _ = proxy.send_event(AppEvent::RemoteImageReady { source, file_url });
+            let render_src = fetch_remote_image_to_cache(&source, &root, file_index).ok();
+            let _ = proxy.send_event(AppEvent::RemoteImageReady { source, render_src });
         });
 
-        self.placeholder_file_url()
+        self.placeholder_render_src()
     }
 
-    fn mark_remote_file_url(&mut self, source: &str, file_url: Option<String>) {
-        let state = match file_url {
-            Some(file_url) => RemoteImageState::Ready(file_url),
+    fn mark_remote_render_src(&mut self, source: &str, render_src: Option<String>) {
+        let state = match render_src {
+            Some(render_src) => RemoteImageState::Ready(render_src),
             None => RemoteImageState::Failed,
         };
         self.remote_urls.insert(source.to_string(), state);
     }
 
-    fn placeholder_file_url(&mut self) -> Result<String> {
-        if let Some(file_url) = &self.placeholder_file_url {
-            return Ok(file_url.clone());
+    fn placeholder_render_src(&mut self) -> Result<String> {
+        if let Some(render_src) = &self.placeholder_render_src {
+            return Ok(render_src.clone());
         }
 
-        let path = self.root.join("blocked-image.gif");
-        fs::write(&path, TRANSPARENT_GIF)
-            .with_context(|| format!("failed to write placeholder image {}", path.display()))?;
-        let file_url = file_url_from_path(&path)?;
-        self.placeholder_file_url = Some(file_url.clone());
-        Ok(file_url)
+        let render_src = format!("data:image/gif;base64,{}", encode_base64(TRANSPARENT_GIF));
+        self.placeholder_render_src = Some(render_src.clone());
+        Ok(render_src)
     }
 
     fn cleanup(&mut self) {
@@ -481,7 +478,7 @@ impl ImageCache {
             let _ = fs::remove_dir_all(&self.root);
         }
         self.remote_urls.clear();
-        self.placeholder_file_url = None;
+        self.placeholder_render_src = None;
     }
 }
 
@@ -547,7 +544,7 @@ fn fetch_remote_image_to_cache(image_url: &str, root: &Path, file_index: usize) 
         .with_context(|| format!("failed to cache remote image {}", path.display()))?;
     fs::rename(&partial_path, &path)
         .with_context(|| format!("failed to finalize cached image {}", path.display()))?;
-    file_url_from_path(&path)
+    image_data_uri_from_path(&path)
 }
 
 fn fetch_remote_image_response(
@@ -803,12 +800,12 @@ fn notify_back_history_changed(webview: &WebView, can_go_back: bool) {
     ));
 }
 
-fn notify_remote_image_ready(webview: &WebView, source: &str, file_url: Option<&str>) {
+fn notify_remote_image_ready(webview: &WebView, source: &str, render_src: Option<&str>) {
     let source_json = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".into());
-    let file_url_json =
-        serde_json::to_string(&file_url.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
+    let render_src_json =
+        serde_json::to_string(&render_src.unwrap_or_default()).unwrap_or_else(|_| "\"\"".into());
     let _ = webview.evaluate_script(&format!(
-        "window.__mdReaderRemoteImageReady && window.__mdReaderRemoteImageReady({source_json}, {file_url_json});"
+        "window.__mdReaderRemoteImageReady && window.__mdReaderRemoteImageReady({source_json}, {render_src_json});"
     ));
 }
 
@@ -920,7 +917,7 @@ fn pick_markdown_image(
     }
 
     let source = markdown_image_source_for_path(document_path, &path);
-    let preview_src = file_url_from_path(&path)?;
+    let preview_src = image_data_uri_from_path(&path)?;
     Ok(Some(ImagePickResult {
         source,
         preview_src,
@@ -1302,29 +1299,6 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
-}
-
-fn file_url_from_path(path: &Path) -> Result<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()
-            .context("failed to resolve current directory for file URL")?
-            .join(path)
-    };
-    let normalized = absolute.to_string_lossy().replace('\\', "/");
-
-    #[cfg(windows)]
-    let url = if normalized.starts_with("//") {
-        format!("file:{}", percent_encode_file_url_path(&normalized))
-    } else {
-        format!("file:///{}", percent_encode_file_url_path(&normalized))
-    };
-
-    #[cfg(not(windows))]
-    let url = format!("file://{}", percent_encode_file_url_path(&normalized));
-
-    Ok(url)
 }
 
 fn percent_encode_file_url_path(path: &str) -> String {
@@ -1973,7 +1947,7 @@ fn markdown_image_html(
                 Err(_) => context
                     .cache
                     .as_deref_mut()
-                    .and_then(|cache| cache.placeholder_file_url().ok()),
+                    .and_then(|cache| cache.placeholder_render_src().ok()),
             },
         );
     let src_attr = resolved_src
@@ -2013,7 +1987,7 @@ fn resolve_markdown_image_src(
             "file" => {
                 let path = file_url_to_path(trimmed)?;
                 ensure_image_path_is_renderable(&path)?;
-                file_url_from_path(&path)
+                image_data_uri_from_path(&path)
             }
             "http" | "https" => {
                 if !context.settings.allow_remote_images {
@@ -2022,7 +1996,7 @@ fn resolve_markdown_image_src(
                 let Some(cache) = context.cache.as_deref_mut() else {
                     bail!("image cache is not available");
                 };
-                cache.remote_file_url(trimmed)
+                cache.remote_render_src(trimmed)
             }
             _ => bail!("blocked unsupported image scheme: {scheme}"),
         };
@@ -2046,7 +2020,7 @@ fn resolve_markdown_image_src(
     };
 
     ensure_image_path_is_renderable(&resolved)?;
-    file_url_from_path(&resolved)
+    image_data_uri_from_path(&resolved)
 }
 
 fn escape_html_attribute(value: &str) -> String {
@@ -4407,8 +4381,7 @@ mod tests {
         let image_dir = root.join("images");
         fs::create_dir_all(&image_dir).expect("image test dir should be created");
         let image_path = image_dir.join("pic.png");
-        fs::write(&image_path, b"not checked for local image magic")
-            .expect("image fixture should be written");
+        fs::write(&image_path, TRANSPARENT_GIF).expect("image fixture should be written");
         let document_path = root.join("source.md");
         let mut image_cache = test_image_cache();
         let html = render_markdown_for_document(
@@ -4417,9 +4390,11 @@ mod tests {
             &AppSettings::default(),
             &mut image_cache,
         );
-        let expected_url = file_url_from_path(&image_path).expect("image file URL should build");
+        let expected_src =
+            image_data_uri_from_path(&image_path).expect("image data URI should build");
 
-        assert!(html.contains(&format!(r#"src="{expected_url}""#)));
+        assert!(html.contains(&format!(r#"src="{expected_src}""#)));
+        assert!(!html.contains(r#"src="file:"#));
         assert!(html.contains(r#"data-md-src="images/pic.png""#));
         assert!(html.contains(r#"data-md-title="Flow""#));
 
@@ -4437,8 +4412,9 @@ mod tests {
         );
 
         assert!(html.contains(r#"data-md-src="https://example.com/pic.png""#));
-        assert!(html.contains("blocked-image.gif"));
+        assert!(html.contains("data:image/gif;base64,"));
         assert!(!html.contains(r#"<img src="https://"#));
+        assert!(!html.contains(r#"src="file:"#));
     }
 
     #[test]
