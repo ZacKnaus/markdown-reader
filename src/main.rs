@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     env,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     io::Read,
     iter::Peekable,
@@ -36,6 +36,7 @@ const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 3;
 const REMOTE_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const REMOTE_IMAGE_MAX_PER_WINDOW: usize = 64;
 const EMBEDDED_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const WEBVIEW2_DOWNLOAD_URL: &str = "https://developer.microsoft.com/microsoft-edge/webview2/";
 const DEFAULT_ALLOWED_LAUNCH_EXTENSIONS: &[&str] = &[
     "bmp", "csv", "doc", "docx", "gif", "htm", "html", "jpeg", "jpg", "json", "log", "md",
     "markdown", "odp", "ods", "odt", "pdf", "png", "ppt", "pptx", "rtf", "toml", "tsv", "txt",
@@ -50,33 +51,185 @@ const TRANSPARENT_GIF: &[u8] = &[
 
 fn main() {
     if let Err(error) = run() {
+        show_startup_error(&error);
         eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
-    let input_path = parse_single_input_path()?;
-    let markdown = fs::read_to_string(&input_path)
+    let action = parse_cli_action()?;
+    let input_path = match &action {
+        CliAction::Open { input_path } | CliAction::ExportHtml { input_path, .. } => input_path,
+    };
+    let markdown = fs::read_to_string(input_path)
         .with_context(|| format!("failed to read {}", input_path.display()))?;
     let settings = load_app_settings();
     if let Err(error) = export_builtin_theme_templates(&app_themes_path()) {
         eprintln!("failed to write default theme templates: {error:#}");
     }
-    launch_window(input_path, markdown, settings)
+
+    match action {
+        CliAction::Open { input_path } => launch_window(input_path, markdown, settings),
+        CliAction::ExportHtml {
+            input_path,
+            output_path,
+            self_contained,
+        } => {
+            let output_path = output_path.unwrap_or_else(|| default_export_path(&input_path));
+            export_markdown_html_file(
+                &input_path,
+                &output_path,
+                &markdown,
+                &settings,
+                html_export_mode(self_contained),
+            )?;
+            Ok(())
+        }
+    }
 }
 
-fn parse_single_input_path() -> Result<PathBuf> {
-    let mut args = env::args_os().skip(1);
-    let Some(path) = args.next() else {
-        bail!("usage: markdown-reader <path-to-markdown-file>");
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliAction {
+    Open {
+        input_path: PathBuf,
+    },
+    ExportHtml {
+        input_path: PathBuf,
+        output_path: Option<PathBuf>,
+        self_contained: bool,
+    },
+}
 
-    if args.next().is_some() {
-        bail!("usage: markdown-reader <path-to-markdown-file>");
+fn parse_cli_action() -> Result<CliAction> {
+    parse_cli_action_from(env::args_os().skip(1))
+}
+
+fn parse_cli_action_from<I>(args: I) -> Result<CliAction>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut export_html = false;
+    let mut self_contained = false;
+    let mut paths = Vec::new();
+
+    for arg in args {
+        if arg == OsStr::new("--export-html") {
+            export_html = true;
+        } else if arg == OsStr::new("--self-contained")
+            || arg == OsStr::new("--self-contained-html")
+        {
+            self_contained = true;
+        } else if arg == OsStr::new("--help") || arg == OsStr::new("-h") {
+            bail!("{}", cli_usage());
+        } else if arg.to_string_lossy().starts_with("--") {
+            bail!("unknown option: {}\n{}", arg.to_string_lossy(), cli_usage());
+        } else {
+            paths.push(PathBuf::from(arg));
+        }
     }
 
-    Ok(PathBuf::from(path))
+    if export_html {
+        return match paths.as_slice() {
+            [input_path] => Ok(CliAction::ExportHtml {
+                input_path: input_path.clone(),
+                output_path: None,
+                self_contained,
+            }),
+            [input_path, output_path] => Ok(CliAction::ExportHtml {
+                input_path: input_path.clone(),
+                output_path: Some(output_path.clone()),
+                self_contained,
+            }),
+            _ => bail!("{}", cli_usage()),
+        };
+    }
+
+    if self_contained {
+        bail!("--self-contained requires --export-html\n{}", cli_usage());
+    }
+
+    match paths.as_slice() {
+        [input_path] => Ok(CliAction::Open {
+            input_path: input_path.clone(),
+        }),
+        _ => bail!("{}", cli_usage()),
+    }
+}
+
+fn cli_usage() -> &'static str {
+    "usage: markdown-reader <path-to-markdown-file>\n       markdown-reader --export-html [--self-contained] <path-to-markdown-file> [output.html]"
+}
+
+fn show_startup_error(error: &anyhow::Error) {
+    if is_webview2_runtime_error(error) {
+        let description = format!(
+            "{}\n\nClick OK to open the Microsoft download page.",
+            webview2_runtime_missing_message()
+        );
+        if show_error_message("Markdown Reader needs WebView2", &description, true) {
+            let _ = open_with_default_handler(OsStr::new(WEBVIEW2_DOWNLOAD_URL));
+        }
+        return;
+    }
+
+    show_error_message("Markdown Reader could not start", &error.to_string(), false);
+}
+
+#[cfg(windows)]
+fn show_error_message(title: &str, message: &str, offer_cancel: bool) -> bool {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut c_void,
+            lp_text: *const u16,
+            lp_caption: *const u16,
+            u_type: u32,
+        ) -> i32;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_OKCANCEL: u32 = 0x0000_0001;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    const IDOK: i32 = 1;
+
+    let text = wide(message);
+    let caption = wide(title);
+    let buttons = if offer_cancel { MB_OKCANCEL } else { MB_OK };
+    let result = unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            buttons | MB_ICONERROR,
+        )
+    };
+    result == IDOK
+}
+
+#[cfg(not(windows))]
+fn show_error_message(title: &str, message: &str, _offer_cancel: bool) -> bool {
+    eprintln!("{title}: {message}");
+    false
+}
+
+fn is_webview2_runtime_error(error: &anyhow::Error) -> bool {
+    let details = format!("{error:#}").to_ascii_lowercase();
+    details.contains("webview2")
+        || (details.contains("webview") && details.contains("runtime"))
+        || details.contains("failed to create webview2 surface")
+}
+
+fn webview2_runtime_missing_message() -> String {
+    format!(
+        "Markdown Reader needs the Microsoft Edge WebView2 Runtime to display documents. Install the Evergreen Runtime from Microsoft, then open the document again.\n\nDownload: {WEBVIEW2_DOWNLOAD_URL}"
+    )
 }
 
 fn app_window_icon() -> Result<Icon> {
@@ -116,6 +269,15 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
             Ok(IpcMessage::Save { markdown }) => {
                 let _ = proxy.send_event(AppEvent::Save { markdown });
             }
+            Ok(IpcMessage::ExportHtml {
+                markdown,
+                self_contained,
+            }) => {
+                let _ = proxy.send_event(AppEvent::ExportHtml {
+                    markdown,
+                    self_contained,
+                });
+            }
             Ok(IpcMessage::Close) => {
                 let _ = proxy.send_event(AppEvent::Close);
             }
@@ -127,6 +289,9 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
             }
             Ok(IpcMessage::PickImage { embed_base64 }) => {
                 let _ = proxy.send_event(AppEvent::PickImage { embed_base64 });
+            }
+            Ok(IpcMessage::EmbedImage { source }) => {
+                let _ = proxy.send_event(AppEvent::EmbedImage { source });
             }
             Ok(IpcMessage::OpenLink { href, behavior }) => {
                 let _ = proxy.send_event(AppEvent::OpenLink { href, behavior });
@@ -199,6 +364,23 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                     notify_save_finished(webview, result);
                 }
             }
+            TaoEvent::UserEvent(AppEvent::ExportHtml {
+                markdown,
+                self_contained,
+            }) => {
+                if let Some(webview) = webview.as_ref() {
+                    match export_markdown_html_with_dialog(
+                        &input_path,
+                        &markdown,
+                        &current_settings,
+                        self_contained,
+                    ) {
+                        Ok(Some(path)) => notify_html_export_finished(webview, Ok(path)),
+                        Ok(None) => {}
+                        Err(error) => notify_html_export_finished(webview, Err(error)),
+                    }
+                }
+            }
             TaoEvent::UserEvent(AppEvent::Close) => {
                 image_cache.cleanup();
                 let _ = webview.take();
@@ -230,6 +412,15 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                         Ok(None) => {}
                         Err(error) => notify_image_picked(webview, Err(error)),
                     }
+                }
+            }
+            TaoEvent::UserEvent(AppEvent::EmbedImage { source }) => {
+                if let Some(webview) = webview.as_ref() {
+                    notify_image_embedded(
+                        webview,
+                        embed_markdown_image_source(&input_path, &source)
+                            .map(|data_uri| ImageEmbedResult { source, data_uri }),
+                    );
                 }
             }
             TaoEvent::UserEvent(AppEvent::OpenLink { href, behavior }) => {
@@ -319,6 +510,10 @@ enum AppEvent {
     Save {
         markdown: String,
     },
+    ExportHtml {
+        markdown: String,
+        self_contained: bool,
+    },
     Close,
     SaveSettings {
         settings: AppSettings,
@@ -326,6 +521,9 @@ enum AppEvent {
     PickCustomCss,
     PickImage {
         embed_base64: bool,
+    },
+    EmbedImage {
+        source: String,
     },
     OpenLink {
         href: String,
@@ -348,6 +546,11 @@ enum IpcMessage {
     Save {
         markdown: String,
     },
+    ExportHtml {
+        markdown: String,
+        #[serde(rename = "selfContained")]
+        self_contained: bool,
+    },
     Close,
     SaveSettings {
         settings: AppSettings,
@@ -356,6 +559,9 @@ enum IpcMessage {
     PickImage {
         #[serde(rename = "embedBase64")]
         embed_base64: bool,
+    },
+    EmbedImage {
+        source: String,
     },
     OpenLink {
         href: String,
@@ -390,6 +596,13 @@ struct ImagePickResult {
     preview_src: String,
     alt: String,
     embedded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageEmbedResult {
+    source: String,
+    data_uri: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -696,6 +909,123 @@ const THEMES: &[ThemeDefinition] = &[
     },
 ];
 
+const EXPORT_BASE_CSS: &str = r#"
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--surface);
+  color: var(--ink);
+}
+
+body {
+  margin: 0;
+  padding: 32px;
+  background: var(--surface);
+  color: var(--ink);
+  font: 16px/1.58 "Segoe UI", system-ui, sans-serif;
+}
+
+#rendered {
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+#rendered > :first-child {
+  margin-top: 0;
+}
+
+#rendered h1,
+#rendered h2,
+#rendered h3,
+#rendered h4,
+#rendered h5,
+#rendered h6 {
+  line-height: 1.2;
+  margin: 1.65em 0 0.45em;
+}
+
+#rendered h1 {
+  font-size: 2rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.25em;
+}
+
+#rendered h2 {
+  font-size: 1.55rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.2em;
+}
+
+#rendered h3 {
+  font-size: 1.25rem;
+}
+
+#rendered p,
+#rendered ul,
+#rendered ol,
+#rendered blockquote,
+#rendered pre,
+#rendered table {
+  margin: 0 0 1em;
+}
+
+#rendered a {
+  color: var(--accent);
+}
+
+#rendered pre,
+#rendered code {
+  background: var(--code);
+  font-family: "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+#rendered pre {
+  overflow: auto;
+  padding: 14px 16px;
+  border-radius: 6px;
+}
+
+#rendered code {
+  border-radius: 4px;
+  padding: 0.1em 0.28em;
+}
+
+#rendered pre code {
+  padding: 0;
+  background: transparent;
+}
+
+#rendered blockquote {
+  color: var(--muted);
+  border-left: 3px solid var(--border);
+  padding-left: 14px;
+}
+
+#rendered table {
+  border-collapse: collapse;
+  width: max-content;
+  max-width: 100%;
+}
+
+#rendered th,
+#rendered td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+}
+
+#rendered img {
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+}
+
+#rendered input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+"#;
+
 fn build_app_html(
     markdown: &str,
     document_path: &Path,
@@ -754,6 +1084,18 @@ fn notify_save_finished(webview: &WebView, result: Result<()>) {
     ));
 }
 
+fn notify_html_export_finished(webview: &WebView, result: Result<PathBuf>) {
+    let (ok, message) = match result {
+        Ok(path) => (true, path.display().to_string()),
+        Err(error) => (false, error.to_string()),
+    };
+    let message_json =
+        serde_json::to_string(&message).unwrap_or_else(|_| "\"HTML export failed\"".into());
+    let _ = webview.evaluate_script(&format!(
+        "window.__mdReaderHtmlExportFinished({ok}, {message_json});"
+    ));
+}
+
 fn notify_settings_finished(webview: &WebView, result: Result<()>) {
     let (ok, message) = match result {
         Ok(()) => (true, String::new()),
@@ -792,6 +1134,23 @@ fn notify_image_picked(webview: &WebView, result: Result<ImagePickResult>) {
     };
     let _ = webview.evaluate_script(&format!(
         "window.__mdReaderImagePicked({ok}, {payload_json});"
+    ));
+}
+
+fn notify_image_embedded(webview: &WebView, result: Result<ImageEmbedResult>) {
+    let (ok, payload_json) = match result {
+        Ok(image) => (
+            true,
+            serde_json::to_string(&image).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(error) => (
+            false,
+            serde_json::to_string(&error.to_string())
+                .unwrap_or_else(|_| "\"image embed failed\"".into()),
+        ),
+    };
+    let _ = webview.evaluate_script(&format!(
+        "window.__mdReaderImageEmbedded({ok}, {payload_json});"
     ));
 }
 
@@ -931,6 +1290,194 @@ fn pick_markdown_image(
         alt,
         embedded: false,
     }))
+}
+
+fn export_markdown_html_with_dialog(
+    document_path: &Path,
+    markdown: &str,
+    settings: &AppSettings,
+    self_contained: bool,
+) -> Result<Option<PathBuf>> {
+    let default_path = default_export_path(document_path);
+    let default_file_name = default_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document.html");
+    let mut dialog = FileDialog::new()
+        .set_title(if self_contained {
+            "Export self-contained HTML"
+        } else {
+            "Export HTML"
+        })
+        .set_file_name(default_file_name)
+        .add_filter("HTML", &["html", "htm"]);
+    if let Some(parent) = default_path.parent() {
+        dialog = dialog.set_directory(parent);
+    }
+
+    let Some(path) = dialog.save_file() else {
+        return Ok(None);
+    };
+    let output_path = ensure_html_extension(path);
+    export_markdown_html_file(
+        document_path,
+        &output_path,
+        markdown,
+        settings,
+        html_export_mode(self_contained),
+    )?;
+    Ok(Some(output_path))
+}
+
+fn export_markdown_html_file(
+    document_path: &Path,
+    output_path: &Path,
+    markdown: &str,
+    settings: &AppSettings,
+    image_mode: ImageRenderMode,
+) -> Result<()> {
+    let html = standalone_html_document(markdown, document_path, settings, image_mode);
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create export directory {}", parent.display()))?;
+    }
+    fs::write(output_path, html.as_bytes())
+        .with_context(|| format!("failed to export HTML {}", output_path.display()))
+}
+
+fn standalone_html_document(
+    markdown: &str,
+    document_path: &Path,
+    settings: &AppSettings,
+    image_mode: ImageRenderMode,
+) -> String {
+    let expanded_markdown = expand_toc_markers(markdown);
+    let rendered =
+        render_markdown_for_export(&expanded_markdown, document_path, settings, image_mode);
+    let title = document_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Markdown Export");
+    let css = escape_style_text(&export_stylesheet(settings));
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; object-src 'none'; img-src data: file: http: https:; font-src data: file:; style-src 'unsafe-inline';">
+  <title>{}</title>
+  <style>
+{}
+  </style>
+</head>
+<body>
+  <main id="rendered" class="markdown-reader-export">
+{}
+  </main>
+</body>
+</html>
+"#,
+        escape_html_attribute(title),
+        css,
+        rendered
+    )
+}
+
+fn default_export_path(document_path: &Path) -> PathBuf {
+    let mut output_path = document_path.to_path_buf();
+    output_path.set_extension("html");
+    output_path
+}
+
+fn ensure_html_extension(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "html" | "htm"))
+    {
+        path
+    } else {
+        path.with_extension("html")
+    }
+}
+
+fn html_export_mode(self_contained: bool) -> ImageRenderMode {
+    if self_contained {
+        ImageRenderMode::ExportSelfContained
+    } else {
+        ImageRenderMode::ExportOriginal
+    }
+}
+
+fn export_stylesheet(settings: &AppSettings) -> String {
+    let settings = normalize_settings(settings);
+    let mut css = String::new();
+    if settings.theme_id == "custom" {
+        css.push_str(THEMES[0].css);
+    } else {
+        let theme = THEMES
+            .iter()
+            .find(|theme| theme.id == settings.theme_id)
+            .unwrap_or(&THEMES[0]);
+        css.push_str(theme.css);
+    }
+    css.push_str("\n\n");
+    css.push_str(EXPORT_BASE_CSS);
+    if settings.theme_id == "custom" && !settings.custom_css.trim().is_empty() {
+        css.push_str("\n\n");
+        css.push_str(&settings.custom_css);
+    }
+    css
+}
+
+fn escape_style_text(css: &str) -> String {
+    css.replace("</style", "<\\/style")
+        .replace("</STYLE", "<\\/STYLE")
+}
+
+fn embed_markdown_image_source(document_path: &Path, source: &str) -> Result<String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        bail!("image source is empty");
+    }
+    if href_scheme(trimmed).is_some_and(|scheme| scheme.eq_ignore_ascii_case("data")) {
+        if is_safe_data_image_src(trimmed) {
+            return Ok(trimmed.to_string());
+        }
+        bail!("embedded image data is not a supported safe image");
+    }
+
+    let path = resolve_local_image_source_path(document_path, trimmed)?;
+    ensure_image_path_is_renderable(&path)?;
+    image_data_uri_from_path(&path)
+}
+
+fn resolve_local_image_source_path(document_path: &Path, source: &str) -> Result<PathBuf> {
+    if let Some(scheme) = href_scheme(source) {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "file" => file_url_to_path(source),
+            "http" | "https" => bail!("remote images cannot be embedded from the resize overlay"),
+            _ => bail!("unsupported image scheme cannot be embedded: {scheme}"),
+        };
+    }
+
+    let path_part = strip_link_fragment_and_query(source);
+    let decoded = percent_decode_path(path_part)?;
+    if decoded.trim().is_empty() {
+        bail!("image source does not include a path");
+    }
+    let path = PathBuf::from(decoded);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(document_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path))
+    }
 }
 
 fn image_data_uri_from_path(path: &Path) -> Result<String> {
@@ -1504,22 +2051,53 @@ fn ensure_remote_image_ip_is_public(ip_address: IpAddr) -> Result<()> {
     Ok(())
 }
 
-fn is_safe_rendered_image_src(src: &str) -> bool {
-    let Some(scheme) = href_scheme(src.trim()) else {
-        return false;
+fn is_safe_rendered_image_src(src: &str, policy: ImageRenderMode) -> bool {
+    let trimmed = src.trim();
+    let Some(scheme) = href_scheme(trimmed) else {
+        return matches!(
+            policy,
+            ImageRenderMode::ExportOriginal | ImageRenderMode::ExportSelfContained
+        ) && is_safe_relative_export_image_src(trimmed);
     };
 
     if scheme.eq_ignore_ascii_case("data") {
-        return is_safe_data_image_src(src);
+        return is_safe_data_image_src(trimmed);
     }
 
     if scheme.eq_ignore_ascii_case("file") {
-        return file_url_to_path(src)
+        return file_url_to_path(trimmed)
             .map(|path| has_common_image_extension(&path))
             .unwrap_or(false);
     }
 
+    if matches!(
+        policy,
+        ImageRenderMode::ExportOriginal | ImageRenderMode::ExportSelfContained
+    ) && matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+    {
+        return Url::parse(trimmed)
+            .map(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host().is_some()
+            })
+            .unwrap_or(false);
+    }
+
     false
+}
+
+fn is_safe_relative_export_image_src(src: &str) -> bool {
+    if src.is_empty()
+        || src.starts_with("//")
+        || src.contains('\0')
+        || src.to_ascii_lowercase().starts_with("javascript:")
+    {
+        return false;
+    }
+    let path_part = strip_link_fragment_and_query(src);
+    has_common_image_extension(Path::new(path_part))
 }
 
 fn is_safe_data_image_src(src: &str) -> bool {
@@ -1821,10 +2399,18 @@ fn slugify_heading(text: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageRenderMode {
+    AppView,
+    ExportOriginal,
+    ExportSelfContained,
+}
+
 struct ImageRewriteContext<'a> {
     document_path: &'a Path,
     settings: &'a AppSettings,
     cache: Option<&'a mut ImageCache>,
+    mode: ImageRenderMode,
 }
 
 fn render_markdown_for_document(
@@ -1840,6 +2426,25 @@ fn render_markdown_for_document(
             document_path,
             settings: &settings,
             cache: Some(image_cache),
+            mode: ImageRenderMode::AppView,
+        }),
+    )
+}
+
+fn render_markdown_for_export(
+    markdown: &str,
+    document_path: &Path,
+    settings: &AppSettings,
+    mode: ImageRenderMode,
+) -> String {
+    let settings = normalize_settings(settings);
+    render_markdown_internal(
+        markdown,
+        Some(ImageRewriteContext {
+            document_path,
+            settings: &settings,
+            cache: None,
+            mode,
         }),
     )
 }
@@ -1917,9 +2522,17 @@ fn render_markdown_internal(
         }
     }
 
+    let image_src_policy = image_context
+        .as_ref()
+        .map(|context| context.mode)
+        .unwrap_or(ImageRenderMode::AppView);
     let mut unsafe_html = String::new();
     html::push_html(&mut unsafe_html, indexed_events.into_iter());
-    sanitize_rendered_html(&unsafe_html)
+    if image_context.is_some() {
+        sanitize_rendered_html_with_policy(&unsafe_html, image_src_policy)
+    } else {
+        sanitize_rendered_html(&unsafe_html)
+    }
 }
 
 fn collect_image_alt_text<'a>(parser: &mut Peekable<Parser<'a>>) -> String {
@@ -2079,12 +2692,42 @@ fn markdown_image_html(
         .as_deref()
         .map(|height| format!(r#" data-md-height="{}""#, escape_html_attribute(height)))
         .unwrap_or_default();
+    let style_attr = image_size_style_attribute(image_size);
 
     format!(
-        r#"<img{src_attr} alt="{}" data-md-src="{}"{title_attr}{width_attr}{height_attr} />"#,
+        r#"<img{src_attr} alt="{}" data-md-src="{}"{title_attr}{width_attr}{height_attr}{style_attr} />"#,
         escape_html_attribute(alt),
         escape_html_attribute(original_src)
     )
+}
+
+fn image_size_style_attribute(image_size: &ImageSizeAttributes) -> String {
+    let mut declarations = Vec::new();
+    if let Some(width) = image_size.width.as_deref() {
+        declarations.push(format!("width: {}", css_image_dimension(width)));
+    }
+    if let Some(height) = image_size.height.as_deref() {
+        declarations.push(format!("height: {}", css_image_dimension(height)));
+    } else if image_size.width.is_some() {
+        declarations.push("height: auto".to_string());
+    }
+
+    if declarations.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#" style="{};""#,
+            escape_html_attribute(&declarations.join("; "))
+        )
+    }
+}
+
+fn css_image_dimension(value: &str) -> String {
+    if value.ends_with('%') {
+        value.to_string()
+    } else {
+        format!("{value}px")
+    }
 }
 
 fn resolve_markdown_image_src(
@@ -2094,6 +2737,14 @@ fn resolve_markdown_image_src(
     let trimmed = original_src.trim();
     if trimmed.is_empty() {
         bail!("image source is empty");
+    }
+
+    match context.mode {
+        ImageRenderMode::AppView => {}
+        ImageRenderMode::ExportOriginal => return resolve_export_original_image_src(trimmed),
+        ImageRenderMode::ExportSelfContained => {
+            return resolve_export_self_contained_image_src(context.document_path, trimmed)
+        }
     }
 
     if let Some(scheme) = href_scheme(trimmed) {
@@ -2138,6 +2789,54 @@ fn resolve_markdown_image_src(
     image_data_uri_from_path(&resolved)
 }
 
+fn resolve_export_original_image_src(original_src: &str) -> Result<String> {
+    let trimmed = original_src.trim();
+    if trimmed.is_empty() {
+        bail!("image source is empty");
+    }
+    if let Some(scheme) = href_scheme(trimmed) {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "data" if is_safe_data_image_src(trimmed) => Ok(trimmed.to_string()),
+            "file" => {
+                let path = file_url_to_path(trimmed)?;
+                if !has_common_image_extension(&path) {
+                    bail!("export image file URL uses an unsupported extension");
+                }
+                Ok(trimmed.to_string())
+            }
+            "http" | "https" => Ok(trimmed.to_string()),
+            _ => bail!("blocked unsupported image scheme: {scheme}"),
+        };
+    }
+    Ok(trimmed.to_string())
+}
+
+fn resolve_export_self_contained_image_src(
+    document_path: &Path,
+    original_src: &str,
+) -> Result<String> {
+    let trimmed = original_src.trim();
+    if trimmed.is_empty() {
+        bail!("image source is empty");
+    }
+    if let Some(scheme) = href_scheme(trimmed) {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "data" if is_safe_data_image_src(trimmed) => Ok(trimmed.to_string()),
+            "file" => {
+                let path = file_url_to_path(trimmed)?;
+                ensure_image_path_is_renderable(&path)?;
+                image_data_uri_from_path(&path)
+            }
+            "http" | "https" => Ok(trimmed.to_string()),
+            _ => bail!("blocked unsupported image scheme: {scheme}"),
+        };
+    }
+
+    let path = resolve_local_image_source_path(document_path, trimmed)?;
+    ensure_image_path_is_renderable(&path)?;
+    image_data_uri_from_path(&path)
+}
+
 fn escape_html_attribute(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -2147,9 +2846,16 @@ fn escape_html_attribute(value: &str) -> String {
 }
 
 fn sanitize_rendered_html(unsafe_html: &str) -> String {
+    sanitize_rendered_html_with_policy(unsafe_html, ImageRenderMode::AppView)
+}
+
+fn sanitize_rendered_html_with_policy(
+    unsafe_html: &str,
+    image_src_policy: ImageRenderMode,
+) -> String {
     let mut builder = ammonia::Builder::default();
     builder.add_generic_attributes(&["id"]);
-    builder.add_url_schemes(&["data", "file"]);
+    builder.add_url_schemes(&["data", "file", "http", "https"]);
     builder.add_tags(&["input"]);
     builder.add_tag_attributes("input", &["type", "checked", "disabled"]);
     builder.set_tag_attribute_value("input", "disabled", "");
@@ -2160,6 +2866,7 @@ fn sanitize_rendered_html(unsafe_html: &str) -> String {
             "data-md-title",
             "data-md-width",
             "data-md-height",
+            "style",
         ],
     );
     builder.add_tag_attributes("div", &["class"]);
@@ -2168,23 +2875,61 @@ fn sanitize_rendered_html(unsafe_html: &str) -> String {
     for tag in ["h1", "h2", "h3", "h4", "h5", "h6"] {
         builder.add_tag_attributes(tag, &["data-md-section-index"]);
     }
-    builder.attribute_filter(|element, attribute, value| match (element, attribute) {
-        ("img", "src") if is_safe_rendered_image_src(value) => Some(value.into()),
-        ("img", "src") => None,
-        ("img", "data-md-width" | "data-md-height") => {
-            normalize_image_dimension(value).map(Into::into)
-        }
-        ("input", "type") if value.eq_ignore_ascii_case("checkbox") => Some("checkbox".into()),
-        ("input", "checked" | "disabled") => Some(String::new().into()),
-        ("input", _) => None,
-        ("div", "class") => allowed_css_classes(value, &["footnote-definition"]),
-        ("span", "class") => allowed_css_classes(value, &["math", "math-inline", "math-display"]),
-        ("sup", "class") => {
-            allowed_css_classes(value, &["footnote-definition-label", "footnote-reference"])
-        }
-        _ => Some(value.into()),
-    });
+    builder.attribute_filter(
+        move |element, attribute, value| match (element, attribute) {
+            ("img", "src") if is_safe_rendered_image_src(value, image_src_policy) => {
+                Some(value.into())
+            }
+            ("img", "src") => None,
+            ("img", "data-md-width" | "data-md-height") => {
+                normalize_image_dimension(value).map(Into::into)
+            }
+            ("img", "style") => sanitize_image_style(value).map(Into::into),
+            ("input", "type") if value.eq_ignore_ascii_case("checkbox") => Some("checkbox".into()),
+            ("input", "checked" | "disabled") => Some(String::new().into()),
+            ("input", _) => None,
+            ("div", "class") => allowed_css_classes(value, &["footnote-definition"]),
+            ("span", "class") => {
+                allowed_css_classes(value, &["math", "math-inline", "math-display"])
+            }
+            ("sup", "class") => {
+                allowed_css_classes(value, &["footnote-definition-label", "footnote-reference"])
+            }
+            _ => Some(value.into()),
+        },
+    );
     builder.clean(unsafe_html).to_string()
+}
+
+fn sanitize_image_style(style: &str) -> Option<String> {
+    let mut declarations = Vec::new();
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        match property.trim().to_ascii_lowercase().as_str() {
+            "width" => {
+                if let Some(dimension) = normalize_image_dimension(value) {
+                    declarations.push(format!("width: {}", css_image_dimension(&dimension)));
+                }
+            }
+            "height" => {
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("auto") {
+                    declarations.push("height: auto".to_string());
+                } else if let Some(dimension) = normalize_image_dimension(value) {
+                    declarations.push(format!("height: {}", css_image_dimension(&dimension)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if declarations.is_empty() {
+        None
+    } else {
+        Some(format!("{};", declarations.join("; ")))
+    }
 }
 
 fn allowed_css_classes(value: &str, allowed: &[&str]) -> Option<std::borrow::Cow<'static, str>> {
@@ -2660,10 +3405,16 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       cursor: ew-resize;
     }
 
-    .image-resize-reset {
+    .image-resize-actions {
       position: absolute;
       right: -1px;
       top: -34px;
+      display: flex;
+      gap: 6px;
+      pointer-events: auto;
+    }
+
+    .image-resize-action {
       min-height: 26px;
       padding: 0 10px;
       border: 1px solid var(--accent);
@@ -2671,7 +3422,13 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       color: #fff;
       background: var(--accent);
       font: 12px/1 "Segoe UI", system-ui, sans-serif;
-      pointer-events: auto;
+      cursor: pointer;
+    }
+
+    .image-resize-action:hover,
+    .image-resize-action:focus-visible {
+      filter: brightness(0.95);
+      outline: 0;
     }
 
     .modal-backdrop[hidden] {
@@ -2984,6 +3741,14 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
         <path d="M8 21v-7h8v7"></path>
       </svg>
     </button>
+    <button id="export-html-button" class="icon-button" type="button" title="Export HTML. Right-click for self-contained HTML." aria-label="Export HTML">
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M6 3h8l4 4v14H6z"></path>
+        <path d="M14 3v5h5"></path>
+        <path d="M9 13h6"></path>
+        <path d="M9 17h6"></path>
+      </svg>
+    </button>
     <label class="switch" title="Plaintext: Alt+Left. Formatted: Alt+Right.">
       <input id="mode-toggle" type="checkbox" aria-label="Toggle rendered Markdown view" title="Plaintext: Alt+Left. Formatted: Alt+Right.">
       <span class="track"></span>
@@ -3068,7 +3833,10 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     <button id="link-menu-action" type="button"></button>
   </div>
   <div id="image-resize-overlay" hidden>
-    <button id="image-resize-reset" class="image-resize-reset" type="button">Reset</button>
+    <div class="image-resize-actions">
+      <button id="image-resize-embed" class="image-resize-action" type="button">Embed</button>
+      <button id="image-resize-reset" class="image-resize-action" type="button">Reset</button>
+    </div>
     <span class="image-resize-handle" data-handle="nw" title="Resize image"></span>
     <span class="image-resize-handle" data-handle="n" title="Resize image"></span>
     <span class="image-resize-handle" data-handle="ne" title="Resize image"></span>
@@ -3088,6 +3856,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     const toggle = document.getElementById("mode-toggle");
     const backButton = document.getElementById("back-button");
     const saveButton = document.getElementById("save-button");
+    const exportHtmlButton = document.getElementById("export-html-button");
     const settingsButton = document.getElementById("settings-button");
     const settingsBackdrop = document.getElementById("settings-backdrop");
     const settingsClose = document.getElementById("settings-close");
@@ -3108,6 +3877,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     const linkMenu = document.getElementById("link-menu");
     const linkMenuAction = document.getElementById("link-menu-action");
     const imageResizeOverlay = document.getElementById("image-resize-overlay");
+    const imageResizeEmbed = document.getElementById("image-resize-embed");
     const imageResizeReset = document.getElementById("image-resize-reset");
     const themeStyle = document.getElementById("theme-style");
     const customThemeStyle = document.getElementById("custom-theme-style");
@@ -3314,6 +4084,43 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       updateImageResizeOverlay();
     }
 
+    function embedSelectedImage() {
+      if (!selectedImage) {
+        return;
+      }
+      const source = selectedImage.getAttribute("data-md-src") || selectedImage.getAttribute("src") || "";
+      if (!source.trim()) {
+        alert("Image source is empty.");
+        return;
+      }
+      postMessage({ kind: "embedImage", source });
+    }
+
+    function applyEmbeddedImageSource(payload) {
+      if (!payload || !payload.dataUri) {
+        return;
+      }
+      let target = null;
+      for (const image of rendered.querySelectorAll("img")) {
+        if ((image.getAttribute("data-md-src") || "") === payload.source) {
+          image.setAttribute("src", payload.dataUri);
+          image.setAttribute("data-md-src", payload.dataUri);
+          target = target || image;
+        }
+      }
+      if (!target && selectedImage) {
+        selectedImage.setAttribute("src", payload.dataUri);
+        selectedImage.setAttribute("data-md-src", payload.dataUri);
+        target = selectedImage;
+      }
+      if (target) {
+        selectImage(target);
+        renderedDirty = true;
+        setDirty(true);
+        updateImageResizeOverlay();
+      }
+    }
+
     function setCanGoBack(value) {
       backButton.disabled = !Boolean(value);
     }
@@ -3459,6 +4266,14 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 
     function saveCurrentDocument() {
       postMessage({ kind: "save", markdown: currentMarkdownForSave() });
+    }
+
+    function exportHtml(selfContained = false) {
+      postMessage({
+        kind: "exportHtml",
+        markdown: currentMarkdownForSave(),
+        selfContained: Boolean(selfContained)
+      });
     }
 
     function switchToRendered() {
@@ -4366,6 +5181,14 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       alert(message || "Save failed.");
     };
 
+    window.__mdReaderHtmlExportFinished = (ok, message) => {
+      if (!ok) {
+        alert(message || "HTML export failed.");
+        return;
+      }
+      alert(message ? `Exported HTML:\n${message}` : "Exported HTML.");
+    };
+
     window.__mdReaderSettingsFinished = (ok, message) => {
       if (!ok) {
         alert(message || "Settings save failed.");
@@ -4398,6 +5221,14 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       }
     };
 
+    window.__mdReaderImageEmbedded = (ok, payload) => {
+      if (!ok) {
+        alert(payload || "Image could not be embedded.");
+        return;
+      }
+      applyEmbeddedImageSource(payload);
+    };
+
     window.__mdReaderOpenLinkFailed = (message) => {
       alert(message || "Link could not be opened.");
     };
@@ -4417,6 +5248,11 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     });
 
     saveButton.addEventListener("click", saveCurrentDocument);
+    exportHtmlButton.addEventListener("click", () => exportHtml(false));
+    exportHtmlButton.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      exportHtml(true);
+    });
     backButton.addEventListener("click", requestBack);
 
     settingsButton.addEventListener("click", openSettings);
@@ -4594,6 +5430,10 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       event.preventDefault();
       resetSelectedImageSize();
     });
+    imageResizeEmbed.addEventListener("click", (event) => {
+      event.preventDefault();
+      embedSelectedImage();
+    });
 
     document.addEventListener("click", (event) => {
       if (!linkMenu.hidden && !linkMenu.contains(event.target)) {
@@ -4675,6 +5515,62 @@ mod tests {
     }
 
     #[test]
+    fn ipc_accepts_export_and_embed_payloads() {
+        let export: IpcMessage = serde_json::from_str(
+            r##"{"kind":"exportHtml","markdown":"# One","selfContained":true}"##,
+        )
+        .expect("export payload should deserialize");
+        let embed: IpcMessage =
+            serde_json::from_str(r#"{"kind":"embedImage","source":"images/pic.png"}"#)
+                .expect("embed payload should deserialize");
+
+        match export {
+            IpcMessage::ExportHtml {
+                markdown,
+                self_contained,
+            } => {
+                assert_eq!(markdown, "# One");
+                assert!(self_contained);
+            }
+            other => panic!("expected ExportHtml message, got {other:?}"),
+        }
+        match embed {
+            IpcMessage::EmbedImage { source } => assert_eq!(source, "images/pic.png"),
+            other => panic!("expected EmbedImage message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_html_export_flags() {
+        assert_eq!(
+            parse_cli_action_from(["doc.md"].into_iter().map(OsString::from))
+                .expect("open action should parse"),
+            CliAction::Open {
+                input_path: PathBuf::from("doc.md")
+            }
+        );
+        assert_eq!(
+            parse_cli_action_from(
+                ["--export-html", "--self-contained", "doc.md", "out.html"]
+                    .into_iter()
+                    .map(OsString::from)
+            )
+            .expect("export action should parse"),
+            CliAction::ExportHtml {
+                input_path: PathBuf::from("doc.md"),
+                output_path: Some(PathBuf::from("out.html")),
+                self_contained: true,
+            }
+        );
+        assert!(parse_cli_action_from(
+            ["--self-contained", "doc.md"]
+                .into_iter()
+                .map(OsString::from)
+        )
+        .is_err());
+    }
+
+    #[test]
     fn app_html_includes_theme_and_control_data() {
         let mut image_cache = test_image_cache();
         let html = build_app_html(
@@ -4695,6 +5591,10 @@ mod tests {
         assert!(html.contains("Go back without saving changes?"));
         assert!(html.contains("save-button"));
         assert!(html.contains("Save (Ctrl+S)"));
+        assert!(html.contains("export-html-button"));
+        assert!(html.contains("Export HTML. Right-click for self-contained HTML."));
+        assert!(html.contains(r#"kind: "exportHtml""#));
+        assert!(html.contains("__mdReaderHtmlExportFinished"));
         assert!(html.contains("settings-button"));
         assert!(html.contains("format-toolbar"));
         assert!(html.contains(r#"title="Strikethrough""#));
@@ -4706,6 +5606,10 @@ mod tests {
         assert!(html.contains("math-button"));
         assert!(html.contains("image-button"));
         assert!(html.contains("image-resize-overlay"));
+        assert!(html.contains("image-resize-embed"));
+        assert!(html.contains("embedSelectedImage"));
+        assert!(html.contains(r#"kind: "embedImage""#));
+        assert!(html.contains("__mdReaderImageEmbedded"));
         assert!(html.contains("image-resize-handle"));
         assert!(html.contains("startImageResize"));
         assert!(html.contains("imageSizeMarkdown"));
@@ -4797,6 +5701,17 @@ mod tests {
     }
 
     #[test]
+    fn webview2_runtime_guidance_mentions_runtime_and_download() {
+        let message = webview2_runtime_missing_message();
+
+        assert!(message.contains("Microsoft Edge WebView2 Runtime"));
+        assert!(message.contains(WEBVIEW2_DOWNLOAD_URL));
+        assert!(is_webview2_runtime_error(&anyhow::anyhow!(
+            "failed to create WebView2 surface"
+        )));
+    }
+
+    #[test]
     fn toc_marker_expands_to_markdown_links() {
         let expanded = expand_toc_markers("[toc]\n\n# One\n\n## Two\n");
 
@@ -4861,7 +5776,86 @@ mod tests {
         assert!(html.contains(r#"data-md-src="pic.png""#));
         assert!(html.contains(r#"data-md-width="320""#));
         assert!(html.contains(r#"data-md-height="240""#));
+        assert!(html.contains(r#"style="width: 320px; height: 240px;""#));
         assert!(html.contains(">After</p>"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn html_export_preserves_original_image_sources_and_embeds_css() {
+        let settings = AppSettings {
+            theme_id: "custom".to_string(),
+            custom_css: "#rendered { color: #123456; }".to_string(),
+            allowed_launch_extensions: Vec::new(),
+            link_click_behavior: LINK_BEHAVIOR_NEW_WINDOW.to_string(),
+            allow_remote_images: false,
+        };
+        let html = standalone_html_document(
+            "![Diagram](images/pic.png \"Flow\"){width=320}\n\nAfter",
+            Path::new("C:/Docs/source.md"),
+            &settings,
+            ImageRenderMode::ExportOriginal,
+        );
+
+        assert!(html.contains("<style>"));
+        assert!(html.contains("--accent: #1f7a68"));
+        assert!(html.contains("#rendered { color: #123456; }"));
+        assert!(html.contains(r#"src="images/pic.png""#));
+        assert!(html.contains(r#"data-md-src="images/pic.png""#));
+        assert!(html.contains(r#"data-md-title="Flow""#));
+        assert!(html.contains(r#"style="width: 320px; height: auto;""#));
+        assert!(html.contains(">After</p>"));
+    }
+
+    #[test]
+    fn self_contained_html_export_embeds_supported_local_images() {
+        let root = env::temp_dir().join(format!(
+            "markdown-reader-export-image-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("export image test dir should be created");
+        let image_path = root.join("pic.png");
+        fs::write(&image_path, TRANSPARENT_GIF).expect("image fixture should be written");
+        let document_path = root.join("source.md");
+        let html = standalone_html_document(
+            "![Diagram](pic.png)",
+            &document_path,
+            &AppSettings::default(),
+            ImageRenderMode::ExportSelfContained,
+        );
+        let expected_src =
+            image_data_uri_from_path(&image_path).expect("image data URI should build");
+
+        assert!(html.contains(&format!(r#"src="{expected_src}""#)));
+        assert!(html.contains(r#"data-md-src="pic.png""#));
+        assert!(!html.contains(r#"<img src="pic.png""#));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embed_markdown_image_source_converts_local_images_to_data_uri() {
+        let root = env::temp_dir().join(format!(
+            "markdown-reader-embed-image-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("embed image test dir should be created");
+        let image_path = root.join("pic.png");
+        fs::write(&image_path, TRANSPARENT_GIF).expect("image fixture should be written");
+        let document_path = root.join("source.md");
+
+        let data_uri = embed_markdown_image_source(&document_path, "pic.png")
+            .expect("local image should embed");
+        assert!(data_uri.starts_with("data:image/gif;base64,"));
+        assert_eq!(
+            embed_markdown_image_source(&document_path, &data_uri)
+                .expect("safe data images should remain stable"),
+            data_uri
+        );
+        assert!(
+            embed_markdown_image_source(&document_path, "https://example.com/pic.png").is_err()
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

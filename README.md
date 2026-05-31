@@ -8,9 +8,19 @@ A small Rust Windows desktop Markdown reader/editor. It opens exactly one Markdo
 cargo run -- path\to\file.md
 ```
 
-The app expects UTF-8 Markdown. Passing zero arguments or more than one positional argument exits with a usage error.
+The app expects UTF-8 Markdown. Passing zero arguments or an invalid argument combination exits with a usage error.
+
+Export the formatted output to standalone HTML from the toolbar button beside Save, or right-click that button for a self-contained export. The same modes are available from the command line:
+
+```powershell
+markdown-reader.exe --export-html path\to\file.md
+markdown-reader.exe --export-html --self-contained path\to\file.md path\to\file.html
+```
+
+Default HTML export preserves the original image paths and URLs while embedding the active theme CSS. Self-contained export embeds supported local images as data URIs and keeps remote image URLs unchanged.
 
 Windows builds use the GUI subsystem, so launching `markdown-reader.exe` opens the app window without a background console window.
+Markdown Reader requires the Microsoft Edge WebView2 Runtime. If it is missing, startup shows a friendly message with the official Microsoft WebView2 download link.
 
 For a no-registry `Open with` entry that shows a friendly filename, build the Windows copy:
 
@@ -35,7 +45,7 @@ Formatted-view edits are converted back to conservative Markdown when saving or 
 
 Click links in formatted view to open safe targets with the Windows default handler or navigate the current reader window, depending on the saved Link Click Behavior setting. When navigating inside the current window, the Back button returns to the prior document in that window's history. Relative document links are resolved from the folder containing the opened Markdown file, internal `#heading` links scroll inside the reader, and local link targets open only when they have no extension, a default allowed extension, or an extension added in Settings. Right-click a rendered link to use the alternate behavior for that link.
 
-Local Markdown images are resolved from the folder containing the opened Markdown file and rendered for common raster formats such as `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, and `.bmp`. The image button can insert a typed path or URL, choose a local file, or embed a selected image as a base64 data URI. Images can be resized in formatted view with drag handles; saved Markdown uses an attribute suffix such as `![Alt](image.png){width=640}`. Remote `https` images are off by default; when enabled in Settings, the app fetches supported remote images into a per-window temp cache and removes that cache when the window closes. The WebView remains blocked from making network requests directly.
+Local Markdown images are resolved from the folder containing the opened Markdown file and rendered for common raster formats such as `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, and `.bmp`. The image button can insert a typed path or URL, choose a local file, or embed a selected image as a base64 data URI. Images can be resized in formatted view with drag handles; use Embed on the resize overlay to convert a selected supported local image into a base64 data URI. Saved Markdown uses an attribute suffix such as `![Alt](image.png){width=640}`. Remote `https` images are off by default; when enabled in Settings, the app fetches supported remote images into a per-window temp cache and removes that cache when the window closes. The WebView remains blocked from making network requests directly.
 
 ## Table Of Contents
 
