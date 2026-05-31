@@ -34,6 +34,7 @@ const LINK_BEHAVIOR_NAVIGATE: &str = "navigate";
 const REMOTE_IMAGE_MAX_REDIRECTS: u32 = 3;
 const REMOTE_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const REMOTE_IMAGE_MAX_PER_WINDOW: usize = 64;
+const EMBEDDED_IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_ALLOWED_LAUNCH_EXTENSIONS: &[&str] = &[
     "bmp", "csv", "doc", "docx", "gif", "htm", "html", "jpeg", "jpg", "json", "log", "md",
     "markdown", "odp", "ods", "odt", "pdf", "png", "ppt", "pptx", "rtf", "toml", "tsv", "txt",
@@ -122,6 +123,9 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
             }
             Ok(IpcMessage::PickCustomCss) => {
                 let _ = proxy.send_event(AppEvent::PickCustomCss);
+            }
+            Ok(IpcMessage::PickImage { embed_base64 }) => {
+                let _ = proxy.send_event(AppEvent::PickImage { embed_base64 });
             }
             Ok(IpcMessage::OpenLink { href, behavior }) => {
                 let _ = proxy.send_event(AppEvent::OpenLink { href, behavior });
@@ -218,6 +222,15 @@ fn launch_window(mut input_path: PathBuf, markdown: String, settings: AppSetting
                     }
                 }
             }
+            TaoEvent::UserEvent(AppEvent::PickImage { embed_base64 }) => {
+                if let Some(webview) = webview.as_ref() {
+                    match pick_markdown_image(&input_path, embed_base64) {
+                        Ok(Some(image)) => notify_image_picked(webview, Ok(image)),
+                        Ok(None) => {}
+                        Err(error) => notify_image_picked(webview, Err(error)),
+                    }
+                }
+            }
             TaoEvent::UserEvent(AppEvent::OpenLink { href, behavior }) => {
                 let behavior = normalize_link_click_behavior(&behavior);
                 let previous_path = input_path.clone();
@@ -310,6 +323,9 @@ enum AppEvent {
         settings: AppSettings,
     },
     PickCustomCss,
+    PickImage {
+        embed_base64: bool,
+    },
     OpenLink {
         href: String,
         behavior: String,
@@ -336,6 +352,9 @@ enum IpcMessage {
         settings: AppSettings,
     },
     PickCustomCss,
+    PickImage {
+        embed_base64: bool,
+    },
     OpenLink {
         href: String,
         behavior: String,
@@ -360,6 +379,15 @@ struct AppSettings {
     link_click_behavior: String,
     #[serde(default)]
     allow_remote_images: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImagePickResult {
+    source: String,
+    preview_src: String,
+    alt: String,
+    embedded: bool,
 }
 
 impl Default for AppSettings {
@@ -745,6 +773,23 @@ fn notify_custom_css_picked(webview: &WebView, result: Result<String>) {
     ));
 }
 
+fn notify_image_picked(webview: &WebView, result: Result<ImagePickResult>) {
+    let (ok, payload_json) = match result {
+        Ok(image) => (
+            true,
+            serde_json::to_string(&image).unwrap_or_else(|_| "{}".into()),
+        ),
+        Err(error) => (
+            false,
+            serde_json::to_string(&error.to_string())
+                .unwrap_or_else(|_| "\"image picker failed\"".into()),
+        ),
+    };
+    let _ = webview.evaluate_script(&format!(
+        "window.__mdReaderImagePicked({ok}, {payload_json});"
+    ));
+}
+
 fn notify_open_link_failed(webview: &WebView, message: &str) {
     let message_json =
         serde_json::to_string(message).unwrap_or_else(|_| "\"failed to open link\"".into());
@@ -842,6 +887,70 @@ fn pick_custom_css(themes_path: &Path) -> Result<Option<String>> {
     fs::read_to_string(&path)
         .with_context(|| format!("failed to read custom CSS {}", path.display()))
         .map(Some)
+}
+
+fn pick_markdown_image(
+    document_path: &Path,
+    embed_base64: bool,
+) -> Result<Option<ImagePickResult>> {
+    let Some(path) = FileDialog::new()
+        .set_title("Choose Markdown image")
+        .add_filter("Images", DEFAULT_IMAGE_EXTENSIONS)
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+
+    ensure_image_path_is_renderable(&path)?;
+    let alt = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Image")
+        .to_string();
+
+    if embed_base64 {
+        let data_uri = image_data_uri_from_path(&path)?;
+        return Ok(Some(ImagePickResult {
+            source: data_uri.clone(),
+            preview_src: data_uri,
+            alt,
+            embedded: true,
+        }));
+    }
+
+    let source = markdown_image_source_for_path(document_path, &path);
+    let preview_src = file_url_from_path(&path)?;
+    Ok(Some(ImagePickResult {
+        source,
+        preview_src,
+        alt,
+        embedded: false,
+    }))
+}
+
+fn image_data_uri_from_path(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect image {}", path.display()))?;
+    if metadata.len() > EMBEDDED_IMAGE_MAX_BYTES {
+        bail!("image is too large to embed as base64");
+    }
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read image {}", path.display()))?;
+    let extension =
+        image_extension_from_magic(&bytes).context("selected file is not a supported image")?;
+    let mime_type = image_mime_type_for_extension(&extension)
+        .context("selected file is not a supported image type")?;
+    Ok(format!("data:{mime_type};base64,{}", encode_base64(&bytes)))
+}
+
+fn markdown_image_source_for_path(document_path: &Path, image_path: &Path) -> String {
+    let base_dir = document_path.parent().unwrap_or_else(|| Path::new("."));
+    let source = image_path
+        .strip_prefix(base_dir)
+        .unwrap_or(image_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    percent_encode_file_url_path(&source)
 }
 
 fn normalize_settings(settings: &AppSettings) -> AppSettings {
@@ -1260,6 +1369,44 @@ fn image_extension_from_magic(bytes: &[u8]) -> Option<String> {
     None
 }
 
+fn image_mime_type_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "bmp" => Some("image/bmp"),
+        "gif" => Some("image/gif"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let triple = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
+
+        encoded.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
+}
+
 fn normalize_image_extension(extension: &str) -> Option<String> {
     let extension = extension
         .trim()
@@ -1380,13 +1527,45 @@ fn is_safe_rendered_image_src(src: &str) -> bool {
         return false;
     };
 
-    if !scheme.eq_ignore_ascii_case("file") {
-        return false;
+    if scheme.eq_ignore_ascii_case("data") {
+        return is_safe_data_image_src(src);
     }
 
-    file_url_to_path(src)
-        .map(|path| has_common_image_extension(&path))
-        .unwrap_or(false)
+    if scheme.eq_ignore_ascii_case("file") {
+        return file_url_to_path(src)
+            .map(|path| has_common_image_extension(&path))
+            .unwrap_or(false);
+    }
+
+    false
+}
+
+fn is_safe_data_image_src(src: &str) -> bool {
+    if src.len() > ((EMBEDDED_IMAGE_MAX_BYTES as usize * 4) / 3 + 256) {
+        return false;
+    }
+    let Some((metadata, encoded)) = src.split_once(',') else {
+        return false;
+    };
+    let metadata = metadata.to_ascii_lowercase();
+    let Some(media_type) = metadata.strip_prefix("data:") else {
+        return false;
+    };
+    let Some((mime_type, parameters)) = media_type.split_once(';') else {
+        return false;
+    };
+    if image_extension_from_content_type(mime_type).is_none() {
+        return false;
+    }
+    if !parameters
+        .split(';')
+        .any(|parameter| parameter.eq_ignore_ascii_case("base64"))
+    {
+        return false;
+    }
+    encoded
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
 #[cfg(windows)]
@@ -1829,6 +2008,7 @@ fn resolve_markdown_image_src(
 
     if let Some(scheme) = href_scheme(trimmed) {
         return match scheme.to_ascii_lowercase().as_str() {
+            "data" if is_safe_data_image_src(trimmed) => Ok(trimmed.to_string()),
             "file" => {
                 let path = file_url_to_path(trimmed)?;
                 ensure_image_path_is_renderable(&path)?;
@@ -1879,7 +2059,7 @@ fn escape_html_attribute(value: &str) -> String {
 fn sanitize_rendered_html(unsafe_html: &str) -> String {
     let mut builder = ammonia::Builder::default();
     builder.add_generic_attributes(&["id"]);
-    builder.add_url_schemes(&["file"]);
+    builder.add_url_schemes(&["data", "file"]);
     builder.add_tags(&["input"]);
     builder.add_tag_attributes("input", &["type", "checked", "disabled"]);
     builder.set_tag_attribute_value("input", "disabled", "");
@@ -2090,6 +2270,30 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     .script-label {
       font-size: 12px;
       line-height: 1;
+    }
+
+    .script-icon {
+      position: relative;
+      width: 18px;
+      height: 18px;
+      display: inline-block;
+      font: 600 14px/18px "Segoe UI", system-ui, sans-serif;
+      text-align: left;
+    }
+
+    .script-mark {
+      position: absolute;
+      right: 0;
+      font-size: 9px;
+      line-height: 1;
+    }
+
+    .script-up {
+      top: 1px;
+    }
+
+    .script-down {
+      bottom: 1px;
     }
 
     .switch {
@@ -2513,9 +2717,16 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       <button class="icon-button format-button" type="button" data-command="bold" title="Bold" aria-label="Bold">B</button>
       <button class="icon-button format-button italic-label" type="button" data-command="italic" title="Italic" aria-label="Italic">I</button>
       <button class="icon-button format-button" type="button" data-command="strikeThrough" title="Strikethrough" aria-label="Strikethrough"><span class="strike-label">S</span></button>
-      <button class="icon-button format-button script-label" type="button" data-command="subscript" title="Subscript" aria-label="Subscript">x<sub>2</sub></button>
-      <button class="icon-button format-button script-label" type="button" data-command="superscript" title="Superscript" aria-label="Superscript">x<sup>2</sup></button>
+      <button class="icon-button format-button script-label" type="button" data-command="subscript" title="Subscript" aria-label="Subscript"><span class="script-icon">x<span class="script-mark script-down">2</span></span></button>
+      <button class="icon-button format-button script-label" type="button" data-command="superscript" title="Superscript" aria-label="Superscript"><span class="script-icon">x<span class="script-mark script-up">2</span></span></button>
       <button id="inline-code-button" class="icon-button format-button" type="button" title="Inline code" aria-label="Inline code">{}</button>
+      <button id="code-block-button" class="icon-button" type="button" title="Code block" aria-label="Code block">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m8 8-4 4 4 4"></path>
+          <path d="m16 8 4 4-4 4"></path>
+          <path d="m14 4-4 16"></path>
+        </svg>
+      </button>
       <button id="math-button" class="icon-button format-button" type="button" title="Math" aria-label="Math">{x}</button>
       <button id="link-button" class="icon-button" type="button" title="Link" aria-label="Link">
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2612,6 +2823,10 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
           Theme
           <select id="theme-select"></select>
         </label>
+	        <label class="field" for="custom-css-button">
+	          Custom CSS
+	          <button id="custom-css-button" class="settings-button" type="button">Choose CSS...</button>
+	        </label>
 	        <label class="field" for="link-click-behavior">
 	          Link Click Behavior
 	          <select id="link-click-behavior">
@@ -2622,10 +2837,6 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 	        <label class="field checkbox-field" for="allow-remote-images">
 	          <span>Remote Images</span>
 	          <input id="allow-remote-images" type="checkbox">
-	        </label>
-	        <label class="field" for="custom-css-button">
-	          Custom CSS
-	          <button id="custom-css-button" class="settings-button" type="button">Choose CSS...</button>
 	        </label>
 	        <label class="field" for="allowed-launch-extensions">
 	          <span class="field-label">
@@ -2696,6 +2907,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     const customThemeStyle = document.getElementById("custom-theme-style");
     const blockFormat = document.getElementById("block-format");
 	    const inlineCodeButton = document.getElementById("inline-code-button");
+	    const codeBlockButton = document.getElementById("code-block-button");
 	    const linkButton = document.getElementById("link-button");
 	    const imageButton = document.getElementById("image-button");
 	    const mathButton = document.getElementById("math-button");
@@ -3471,6 +3683,9 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
           submit: "Insert",
           fields: `
             <label class="field" for="insert-image-source">Source<input id="insert-image-source" name="source" type="text" autocomplete="off"></label>
+            <input id="insert-image-preview" name="previewSrc" type="hidden">
+            <label class="field checkbox-field" for="insert-image-embed"><span>Embed selected file as base64</span><input id="insert-image-embed" name="embedBase64" type="checkbox"></label>
+            <button id="insert-image-browse" class="settings-button" type="button">Choose image...</button>
             <label class="field" for="insert-image-alt">Alt text<input id="insert-image-alt" name="alt" type="text" autocomplete="off" value="${escapeAttribute(selectedText)}"></label>
             <label class="field" for="insert-image-title">Title<input id="insert-image-title" name="title" type="text" autocomplete="off"></label>
           `
@@ -3479,8 +3694,8 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
           title: "Insert Table",
           submit: "Insert",
           fields: `
-            <label class="field" for="insert-table-rows">Rows<input id="insert-table-rows" name="rows" type="number" inputmode="numeric" min="1" max="25" step="1" value="3"></label>
-            <label class="field" for="insert-table-columns">Columns<input id="insert-table-columns" name="columns" type="number" inputmode="numeric" min="1" max="12" step="1" value="3"></label>
+            <label class="field" for="insert-table-rows">Rows<input id="insert-table-rows" name="rows" type="number" inputmode="numeric" min="1" max="500" step="1" value="3"></label>
+            <label class="field" for="insert-table-columns">Columns<input id="insert-table-columns" name="columns" type="number" inputmode="numeric" min="1" max="50" step="1" value="3"></label>
           `
         },
         footnote: {
@@ -3515,6 +3730,10 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       insertTitle.textContent = definition.title;
       insertSubmit.textContent = definition.submit;
       insertFields.innerHTML = definition.fields;
+      const browseButton = document.getElementById("insert-image-browse");
+      if (browseButton) {
+        browseButton.addEventListener("click", pickImageFile);
+      }
       insertBackdrop.hidden = false;
       requestAnimationFrame(() => {
         const firstField = insertFields.querySelector("input, textarea, select");
@@ -3558,6 +3777,13 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       return field ? normalizeText(field.value || "").trim() : "";
     }
 
+    function setFormValue(name, value) {
+      const field = insertForm.elements.namedItem(name);
+      if (field) {
+        field.value = value || "";
+      }
+    }
+
     function formNumber(name, fallback, min, max) {
       const field = insertForm.elements.namedItem(name);
       const parsed = Number.parseInt(field ? field.value : "", 10);
@@ -3567,6 +3793,11 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
         field.value = String(bounded);
       }
       return bounded;
+    }
+
+    function pickImageFile() {
+      const embedField = insertForm.elements.namedItem("embedBase64");
+      postMessage({ kind: "pickImage", embedBase64: Boolean(embedField && embedField.checked) });
     }
 
     function applyLinkFromForm() {
@@ -3595,14 +3826,15 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       }
       const alt = formValue("alt");
       const title = formValue("title");
-      insertHtmlAtSelection(`<img src="${escapeAttribute(source)}" alt="${escapeAttribute(alt)}" data-md-src="${escapeAttribute(source)}"${title ? ` title="${escapeAttribute(title)}" data-md-title="${escapeAttribute(title)}"` : ""}>`);
+      const previewSrc = formValue("previewSrc") || source;
+      insertHtmlAtSelection(`<img src="${escapeAttribute(previewSrc)}" alt="${escapeAttribute(alt)}" data-md-src="${escapeAttribute(source)}"${title ? ` title="${escapeAttribute(title)}" data-md-title="${escapeAttribute(title)}"` : ""}>`);
       closeInsertForm(false);
     }
 
     function applyTableFromForm() {
-      const rows = formNumber("rows", 3, 1, 25);
-      const columns = formNumber("columns", 3, 1, 12);
-      insertHtmlAtSelection(tableHtml(rows, columns));
+      const rows = formNumber("rows", 3, 1, 500);
+      const columns = formNumber("columns", 3, 1, 50);
+      insertHtmlAtSelection(blockWithTrailingParagraph(tableHtml(rows, columns)));
       closeInsertForm(false);
     }
 
@@ -3618,7 +3850,7 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
     function applyDefinitionListFromForm() {
       const term = formValue("term") || "Term";
       const definition = formValue("definition") || "Definition";
-      insertHtmlAtSelection(`<dl><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(definition)}</dd></dl>`);
+      insertHtmlAtSelection(blockWithTrailingParagraph(`<dl><dt>${escapeHtml(term)}</dt><dd>${escapeHtml(definition)}</dd></dl>`));
       closeInsertForm(false);
     }
 
@@ -3635,7 +3867,16 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 
     function applyTaskList() {
       const text = selectedRenderedText() || "Task";
-      insertHtmlAtSelection(`<ul><li><input type="checkbox" disabled> ${escapeHtml(text)}</li></ul>`);
+      insertHtmlAtSelection(blockWithTrailingParagraph(`<ul><li><input type="checkbox" disabled> ${escapeHtml(text)}</li></ul>`));
+    }
+
+    function applyCodeBlock() {
+      const text = selectedRenderedText() || "code";
+      insertHtmlAtSelection(blockWithTrailingParagraph(`<pre><code>${escapeHtml(text)}</code></pre>`));
+    }
+
+    function blockWithTrailingParagraph(html) {
+      return `${html}<p><br></p>`;
     }
 
     function insertHtmlAtSelection(html) {
@@ -3762,6 +4003,21 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
       applyTheme("custom");
     };
 
+    window.__mdReaderImagePicked = (ok, payload) => {
+      if (!ok) {
+        alert(payload || "Image picker failed.");
+        return;
+      }
+      if (insertKind !== "image" || insertBackdrop.hidden || !payload) {
+        return;
+      }
+      setFormValue("source", payload.source || "");
+      setFormValue("previewSrc", payload.previewSrc || payload.source || "");
+      if (payload.alt && !formValue("alt")) {
+        setFormValue("alt", payload.alt);
+      }
+    };
+
     window.__mdReaderOpenLinkFailed = (message) => {
       alert(message || "Link could not be opened.");
     };
@@ -3829,6 +4085,9 @@ const APP_HTML_TEMPLATE: &str = r###"<!doctype html>
 
     inlineCodeButton.addEventListener("mousedown", (event) => event.preventDefault());
     inlineCodeButton.addEventListener("click", applyInlineCode);
+
+	    codeBlockButton.addEventListener("mousedown", (event) => event.preventDefault());
+	    codeBlockButton.addEventListener("click", applyCodeBlock);
 
 	    linkButton.addEventListener("mousedown", (event) => event.preventDefault());
 	    linkButton.addEventListener("click", () => openInsertForm("link", linkButton));
@@ -4021,10 +4280,20 @@ mod tests {
         assert!(html.contains(r#"title="Strikethrough""#));
         assert!(html.contains("data-command=\"subscript\""));
         assert!(html.contains("data-command=\"superscript\""));
+        assert!(html.contains("script-down"));
+        assert!(html.contains("script-up"));
+        assert!(html.contains("code-block-button"));
         assert!(html.contains("math-button"));
         assert!(html.contains("image-button"));
+        assert!(html.contains("insert-image-browse"));
+        assert!(html.contains("insert-image-embed"));
+        assert!(html.contains("previewSrc"));
+        assert!(html.contains(r#"kind: "pickImage""#));
+        assert!(html.contains("__mdReaderImagePicked"));
         assert!(html.contains("task-list-button"));
         assert!(html.contains("table-button"));
+        assert!(html.contains(r#"max="500""#));
+        assert!(html.contains(r#"max="50""#));
         assert!(html.contains("definition-list-button"));
         assert!(html.contains("footnote-button"));
         assert!(html.contains("insert-backdrop"));
@@ -4061,6 +4330,8 @@ mod tests {
         assert!(html.contains("openInsertForm"));
         assert!(html.contains("applyImageFromForm"));
         assert!(html.contains("applyTaskList"));
+        assert!(html.contains("applyCodeBlock"));
+        assert!(html.contains("blockWithTrailingParagraph"));
         assert!(html.contains("taskListPrefix"));
         assert!(html.contains("mathMarkdown"));
         assert!(!html.contains("window.prompt"));
@@ -4198,6 +4469,26 @@ mod tests {
         assert_eq!(image_extension_from_content_type("image/svg+xml"), None);
         assert_eq!(normalize_image_extension("svg"), None);
         assert_eq!(normalize_image_extension("ico"), None);
+        assert_eq!(encode_base64(b"abc"), "YWJj");
+        assert_eq!(encode_base64(b"ab"), "YWI=");
+        assert!(is_safe_data_image_src("data:image/png;base64,YWJj"));
+        assert!(!is_safe_data_image_src(
+            "data:text/html;base64,PGgxPk5vPC9oMT4="
+        ));
+    }
+
+    #[test]
+    fn renderer_allows_safe_embedded_data_images() {
+        let mut image_cache = test_image_cache();
+        let html = render_markdown_for_document(
+            "![Pixel](data:image/png;base64,YWJj)",
+            Path::new("C:/Docs/source.md"),
+            &AppSettings::default(),
+            &mut image_cache,
+        );
+
+        assert!(html.contains(r#"src="data:image/png;base64,YWJj""#));
+        assert!(html.contains(r#"data-md-src="data:image/png;base64,YWJj""#));
     }
 
     #[test]
